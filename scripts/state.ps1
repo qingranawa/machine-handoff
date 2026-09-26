@@ -425,7 +425,9 @@ function ConvertTo-MHCell {
 
 function Write-MHTable {
     param([string[]]$Headers, $Rows)
-    $lines = @('| ' + ($Headers -join ' | ') + ' |', '| ' + (@($Headers | ForEach-Object { '---' }) -join ' | ') + ' |')
+    $lines = @()
+    $lines += '| ' + ($Headers -join ' | ') + ' |'
+    $lines += '| ' + (@($Headers | ForEach-Object { '---' }) -join ' | ') + ' |'
     foreach ($row in $Rows) {
         $cells = @()
         foreach ($cell in $row) { $cells += ConvertTo-MHCell -Value $cell }
