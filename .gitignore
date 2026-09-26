@@ -1,0 +1,15 @@
+# Local task-planning notes; these are not release documentation.
+task_plan.md
+findings.md
+progress.md
+/docs/superpowers/plans/
+
+# Local test outputs, downloaded archives, and tool caches.
+/test-results/
+/artifacts/
+/node_modules/
+*.tgz
+*.nupkg
+*.log
+.DS_Store
+Thumbs.db

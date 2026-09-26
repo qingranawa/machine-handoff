@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "snapshotId": "{{SNAPSHOT_ID}}",
+  "sourceId": "{{SOURCE_ID}}",
+  "role": "{{ROLE}}",
+  "collectedAt": "{{COLLECTED_AT}}",
+  "platform": "windows",
+  "collection": {
+    "roots": [],
+    "excludes": [],
+    "maxDepth": 3,
+    "domainStatus": {}
+  },
+  "system": {},
+  "env": {},
+  "software": [],
+  "dev": [],
+  "shell": {},
+  "editors": [],
+  "agents": [],
+  "wsl": [],
+  "dataLocations": [],
+  "unbackedDataCandidates": [],
+  "manualItems": []
+}
