@@ -2,7 +2,7 @@
 
 `machine-handoff` 是一个 Windows 开发工作站换机、重装和恢复用的 Agent Skill。它收集有限的本机开发环境信息，生成可阅读的 Handoff Package，并在目标机上比较状态、列出需要人工确认的恢复计划。
 
-Skill 遵循 Agent Skills 目录格式，包含 `SKILL.md`、PowerShell 脚本、references 和模板。设计与安全边界见 [MACHINE_HANDOFF_SKILL_SPEC.md](MACHINE_HANDOFF_SKILL_SPEC.md)。
+Skill 遵循 Agent Skills 目录格式，包含 `SKILL.md`、PowerShell 脚本、references 和模板。
 
 ## 支持范围
 
@@ -13,17 +13,15 @@ Skill 遵循 Agent Skills 目录格式，包含 `SKILL.md`、PowerShell 脚本�
 
 ## 安装
 
-使用第三方 Vercel Skills CLI 从 `qingranawa/machine-handoff` 安装到 Codex 用户目录：
+使用 Vercel Skills CLI 从 GitHub 安装到 Codex 用户目录：
 
 ```powershell
 npx skills add qingranawa/machine-handoff --skill machine-handoff --global --agent codex
 ```
 
-本项目不发布自己的 npm 安装器；`npx` 调用 Vercel 的 `skills` CLI，从 GitHub 安装静态 Skill 文件。安装只会把 Skill 文件放到 Agent Skills 目录，不会运行收集脚本。安装器需要 Node.js/npm；首次使用 `npx` 时，npm 会让你确认是否安装并运行 CLI。PowerShell 是运行本 Skill 的要求，Node.js 不是。
+Vercel Skills CLI 将静态 Skill 文件安装到 Agent Skills 目录，不会运行收集脚本。安装器需要 Node.js/npm；运行本 Skill 脚本需要 PowerShell。首次使用 `npx` 时，npm 可能会提示确认运行 CLI。
 
-因此安装命令是 `npx skills add ...`，不是 `npx machine-handoff`。
-
-`skills` 是 Vercel 提供的第三方工具，不属于 Codex。该 CLI 提供匿名使用遥测；可在安装前设置 `DISABLE_TELEMETRY=1` 或 `DO_NOT_TRACK=1` 关闭。详见 [skills CLI](https://github.com/vercel-labs/skills)。
+`skills` 由 Vercel 提供，并包含匿名使用遥测。安装前设置 `DISABLE_TELEMETRY=1` 或 `DO_NOT_TRACK=1` 可关闭遥测。详见 [skills CLI](https://github.com/vercel-labs/skills)。
 
 更新与卸载：
 
@@ -32,7 +30,7 @@ npx skills update machine-handoff --global
 npx skills remove machine-handoff --global --agent codex
 ```
 
-也可手动把本仓库根目录的 `SKILL.md`、`scripts/`、`references/` 和 `assets/` 复制到目标 Agent 的 `skills/machine-handoff/` 目录。无需复制 README、LICENSE、规格、测试或 CI 文件。安装或更新后先检查脚本来源和目标路径，再调用 Skill。
+也可手动把本仓库根目录的 `SKILL.md`、`scripts/`、`references/` 和 `assets/` 复制到目标 Agent 的 `skills/machine-handoff/` 目录。安装或更新后先检查脚本来源和目标路径，再调用 Skill。
 
 ## 使用模式
 
