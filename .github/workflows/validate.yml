@@ -10,14 +10,14 @@ permissions:
 jobs:
   smoke:
     runs-on: windows-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        shell: [powershell, pwsh]
     steps:
       - name: Check out repository
         uses: actions/checkout@v7.0.1
 
-      - name: Run PowerShell smoke suite
-        shell: ${{ matrix.shell }}
+      - name: Run Windows PowerShell 5.1 smoke suite
+        shell: powershell
+        run: ./tests/smoke.ps1
+
+      - name: Run PowerShell 7 smoke suite
+        shell: pwsh
         run: ./tests/smoke.ps1
