@@ -7,19 +7,19 @@ Skill 遵循 Agent Skills 目录格式，包含 `SKILL.md`、PowerShell 脚本�
 ## 支持范围
 
 - Windows 工作站，Windows PowerShell 5.1 为基线；PowerShell 7 也可运行。
-- Codex 为首要支持目标。Skill 的基础目录格式可由其他兼容 Agent Skills 的工具使用；脚本行为仍仅面向 Windows。
+- 推荐使用 Codex。Skill 遵循 Agent Skills 目录格式；脚本运行环境为 Windows PowerShell。
 - `winget`、WSL、Git、编辑器和其他开发工具均为可选项。缺失的程序会记录为 `NOT_FOUND`，未运行的检查保留为 `NOT_TESTED` 或 `UNKNOWN`。
 - 收集限定在已知用户配置位置及明确指定的根目录、深度和排除项内；不会递归扫描整个磁盘。
 
 ## 安装
 
-使用 Vercel Skills CLI 从 GitHub 安装到 Codex 用户目录：
+使用 Vercel Skills CLI 从 GitHub 安装到目标 Agent 的用户级 Skill 目录：
 
 ```powershell
-npx skills add qingranawa/machine-handoff --skill machine-handoff --global --agent codex
+npx skills add qingranawa/machine-handoff --skill machine-handoff --global
 ```
 
-Vercel Skills CLI 将静态 Skill 文件安装到 Agent Skills 目录，不会运行收集脚本。安装器需要 Node.js/npm；运行本 Skill 脚本需要 PowerShell。首次使用 `npx` 时，npm 可能会提示确认运行 CLI。
+安装时按 Vercel Skills CLI 的提示选择目标 Agent。推荐选择 Codex。CLI 将静态 Skill 文件安装到所选 Agent 的用户级目录，不会运行收集脚本。安装器需要 Node.js/npm；运行本 Skill 脚本需要 PowerShell。首次使用 `npx` 时，npm 可能会提示确认运行 CLI。
 
 `skills` 由 Vercel 提供，并包含匿名使用遥测。安装前设置 `DISABLE_TELEMETRY=1` 或 `DO_NOT_TRACK=1` 可关闭遥测。详见 [skills CLI](https://github.com/vercel-labs/skills)。
 
