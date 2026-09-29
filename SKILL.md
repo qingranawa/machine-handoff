@@ -1,5 +1,5 @@
 ---
-name: machine-handoff
+name: machine-handoff-skill
 description: Use when a Windows development workstation is being prepared for replacement, Windows reinstall, environment recovery, or post-migration validation, especially when developer tools, AI coding agents, WSL, and local project data are involved.
 license: MIT
 ---
