@@ -1,9 +1,45 @@
 ﻿Set-StrictMode -Version Latest
 
+function Test-MHSerializedValue {
+    param($Value)
+
+    if ($null -eq $Value) { return $false }
+    if ($Value -is [string]) { return [bool](Test-MHConfigSecretText -Text $Value -Structured) }
+    if ($Value.GetType().IsValueType) { return $false }
+    if ($Value -is [System.Collections.IDictionary]) {
+        foreach ($key in $Value.Keys) {
+            $entry = $Value[$key]
+            if ((Test-MHConfigSecretName -Name ([string]$key)) -and $null -ne $entry -and [string]$entry -ne '<REDACTED>' -and [string]$entry -ne '') { return $true }
+            if (Test-MHSerializedValue -Value $entry) { return $true }
+        }
+        return $false
+    }
+    if ($Value -is [System.Collections.IEnumerable]) {
+        foreach ($entry in $Value) { if (Test-MHSerializedValue -Value $entry) { return $true } }
+        return $false
+    }
+    foreach ($property in @($Value.PSObject.Properties)) {
+        if ((Test-MHConfigSecretName -Name $property.Name) -and $null -ne $property.Value -and [string]$property.Value -ne '<REDACTED>' -and [string]$property.Value -ne '') { return $true }
+        if (Test-MHSerializedValue -Value $property.Value) { return $true }
+    }
+    return $false
+}
+
 function Test-MHSerializedText {
     param([Parameter(Mandatory)][string]$Text)
+    $scanner = Get-Command -Name 'Test-MHConfigSecretText' -CommandType Function -ErrorAction SilentlyContinue
+    if ($scanner) {
+        try {
+            $parsed = ConvertFrom-Json -InputObject $Text -ErrorAction Stop
+            if (Test-MHSerializedValue -Value $parsed) { throw 'REDACTION_BLOCKED' }
+        } catch {
+            if ($_.Exception.Message -eq 'REDACTION_BLOCKED') { throw }
+            if (Test-MHConfigSecretText -Text $Text) { throw 'REDACTION_BLOCKED' }
+        }
+        return
+    }
     $patterns = @(
-        '(?i)["'']?(?:api[ _-]?key|access[ _-]?token|refresh[ _-]?token|password|passwd|client_secret|authorization|cookie|private[ _-]?key|bitlocker[ _-]?key)\s*["'']?\s*[:=]\s*["'']?[^"''\s,;\}\]]+',
+        '(?i)["'']?(?:api[ _-]?key|access[ _-]?token|refresh[ _-]?token|password|passwd|pwd|username|user[ _-]?id|uid|client_secret|authorization|cookie|private[ _-]?key|bitlocker[ _-]?key)\s*["'']?\s*[:=]\s*["'']?[^"''\s,;\}\]]+',
         '(?i)\bbearer\s+[A-Za-z0-9._~+/-]{12,}',
         '(?i)://[^/\s:@]+:[^/\s@]+@',
         '\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16})\b',
@@ -69,11 +105,111 @@ function Get-MHField {
     return $Default
 }
 
+function Read-MHBoundedUtf8Text {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][ValidateRange(1, 41943040)][long]$MaxBytes
+    )
+
+    $stream = $null
+    $buffer = New-Object byte[] 8192
+    $memory = New-Object System.IO.MemoryStream
+    try {
+        [void](Assert-MHNoReparseAncestors -Path $Path)
+        $file = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        if ($file.PSIsContainer -or ($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'PATH_REPARSE_BLOCKED' }
+        if ([long]$file.Length -gt $MaxBytes) { throw 'JSON_SIZE_LIMIT' }
+        $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+        if ($stream.Length -gt $MaxBytes) { throw 'JSON_SIZE_LIMIT' }
+        $totalBytes = 0L
+        while ($true) {
+            $remainingWithProbe = ($MaxBytes - $totalBytes) + 1
+            $readLimit = [int][Math]::Min([long]$buffer.Length, $remainingWithProbe)
+            $readCount = $stream.Read($buffer, 0, $readLimit)
+            if ($readCount -le 0) { break }
+            $totalBytes += $readCount
+            if ($totalBytes -gt $MaxBytes) { throw 'JSON_SIZE_LIMIT' }
+            $memory.Write($buffer, 0, $readCount)
+        }
+
+        $bytes = $memory.ToArray()
+        $offset = 0
+        if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { $offset = 3 }
+        $encoding = New-Object System.Text.UTF8Encoding($false, $true)
+        try { return $encoding.GetString($bytes, $offset, $bytes.Length - $offset) } catch { throw 'JSON_ENCODING_INVALID' }
+    } finally {
+        if ($stream) { $stream.Dispose() }
+        $memory.Dispose()
+    }
+}
+
+function Assert-MHJsonComplexity {
+    param(
+        [Parameter(Mandatory)][string]$Text,
+        [Parameter(Mandatory)][ValidateRange(1, 64)][int]$MaxDepth,
+        [Parameter(Mandatory)][ValidateRange(1, 10000)][int]$MaxCollectionItems,
+        [Parameter(Mandatory)][ValidateRange(1, 32768)][int]$MaxStringLength,
+        [Parameter(Mandatory)][ValidateRange(1, 250000)][int]$MaxTokens
+    )
+
+    $containerSeparators = New-Object 'System.Collections.Generic.List[int]'
+    $inString = $false
+    $escaped = $false
+    $stringLength = 0
+    $depth = 0
+    $tokenCount = 0
+    for ($index = 0; $index -lt $Text.Length; $index++) {
+        $character = $Text[$index]
+        if ($inString) {
+            if ($escaped) { $escaped = $false; continue }
+            if ($character -eq '\') { $escaped = $true; continue }
+            if ($character -eq '"') { $inString = $false; continue }
+            $stringLength++
+            if ($stringLength -gt $MaxStringLength) { throw 'JSON_STRING_LIMIT' }
+            continue
+        }
+        if ($character -eq '"') {
+            $inString = $true
+            $stringLength = 0
+            $tokenCount++
+        } elseif ($character -eq '{' -or $character -eq '[') {
+            $depth++
+            if ($depth -gt $MaxDepth) { throw 'JSON_DEPTH_LIMIT' }
+            $containerSeparators.Add(0)
+            $tokenCount++
+        } elseif ($character -eq '}' -or $character -eq ']') {
+            $depth--
+            if ($containerSeparators.Count -gt 0) { $containerSeparators.RemoveAt($containerSeparators.Count - 1) }
+            $tokenCount++
+        } elseif ($character -eq ',') {
+            if ($containerSeparators.Count -gt 0) {
+                $separatorIndex = $containerSeparators.Count - 1
+                $separatorCount = $containerSeparators[$separatorIndex] + 1
+                if ($separatorCount -ge $MaxCollectionItems) { throw 'JSON_COLLECTION_LIMIT' }
+                $containerSeparators[$separatorIndex] = $separatorCount
+            }
+            $tokenCount++
+        } elseif ($character -ne ':' -and -not [char]::IsWhiteSpace($character)) {
+            $tokenCount++
+            while ($index + 1 -lt $Text.Length -and $Text[$index + 1] -notin @(',', ']', '}', ':') -and -not [char]::IsWhiteSpace($Text[$index + 1]) -and $Text[$index + 1] -ne '"') { $index++ }
+        }
+        if ($tokenCount -gt $MaxTokens) { throw 'JSON_TOKEN_LIMIT' }
+    }
+}
+
 function Read-MHJson {
-    param([Parameter(Mandatory)][string]$Path)
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [ValidateRange(1, 41943040)][long]$MaxBytes = 41943040,
+        [ValidateRange(1, 64)][int]$MaxDepth = 64,
+        [ValidateRange(1, 10000)][int]$MaxCollectionItems = 10000,
+        [ValidateRange(1, 32768)][int]$MaxStringLength = 32768,
+        [ValidateRange(1, 250000)][int]$MaxTokens = 250000
+    )
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw 'INPUT_FILE_MISSING' }
     [void](Assert-MHNoReparseAncestors -Path $Path)
-    $text = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 -ErrorAction Stop
+    $text = Read-MHBoundedUtf8Text -Path $Path -MaxBytes $MaxBytes
+    Assert-MHJsonComplexity -Text $text -MaxDepth $MaxDepth -MaxCollectionItems $MaxCollectionItems -MaxStringLength $MaxStringLength -MaxTokens $MaxTokens
     Test-MHSerializedText -Text $text
     try { return ConvertFrom-Json -InputObject $text -ErrorAction Stop } catch { throw 'INVALID_JSON' }
 }
@@ -91,13 +227,58 @@ function Test-MHArrayShape {
     return ($RequiredProperties.Count -gt 0)
 }
 
+function Assert-MHDocumentValueBounds {
+    param(
+        $Value,
+        [int]$Depth = 0,
+        [Parameter(Mandatory)][ref]$NodeCount,
+        [Parameter(Mandatory)][ValidateSet('SNAPSHOT_LIMIT', 'DECISIONS_LIMIT')][string]$ErrorCode
+    )
+
+    if ($Depth -gt 64) { throw $ErrorCode }
+    $NodeCount.Value = [int]$NodeCount.Value + 1
+    if ($NodeCount.Value -gt 250000) { throw $ErrorCode }
+    if ($null -eq $Value -or $Value.GetType().IsValueType) { return }
+    if ($Value -is [string]) { if ($Value.Length -gt 32768) { throw $ErrorCode }; return }
+    if ($Value -is [System.Collections.IDictionary]) {
+        if ($Value.Count -gt 10000) { throw $ErrorCode }
+        foreach ($key in $Value.Keys) { Assert-MHDocumentValueBounds -Value $Value[$key] -Depth ($Depth + 1) -NodeCount $NodeCount -ErrorCode $ErrorCode }
+        return
+    }
+    if ($Value -is [System.Collections.IEnumerable]) {
+        $itemCount = 0
+        foreach ($item in $Value) {
+            $itemCount++
+            if ($itemCount -gt 10000) { throw $ErrorCode }
+            Assert-MHDocumentValueBounds -Value $item -Depth ($Depth + 1) -NodeCount $NodeCount -ErrorCode $ErrorCode
+        }
+        return
+    }
+    foreach ($property in @($Value.PSObject.Properties)) {
+        Assert-MHDocumentValueBounds -Value $property.Value -Depth ($Depth + 1) -NodeCount $NodeCount -ErrorCode $ErrorCode
+    }
+}
+
 function Test-MHSnapshot {
     param([Parameter(Mandatory)]$Snapshot)
-    if ($Snapshot.schemaVersion -ne 1 -or $Snapshot.platform -ne 'windows') { throw 'UNSUPPORTED_SCHEMA' }
+    $nodeCount = 0
+    Assert-MHDocumentValueBounds -Value $Snapshot -NodeCount ([ref]$nodeCount) -ErrorCode 'SNAPSHOT_LIMIT'
+    if ($Snapshot.schemaVersion -notin @(1, 2) -or $Snapshot.platform -ne 'windows') { throw 'UNSUPPORTED_SCHEMA' }
     if ([string]::IsNullOrWhiteSpace([string]$Snapshot.snapshotId) -or [string]::IsNullOrWhiteSpace([string]$Snapshot.sourceId)) { throw 'INVALID_SNAPSHOT' }
     if ($Snapshot.role -notin @('SOURCE', 'DESTINATION')) { throw 'INVALID_SNAPSHOT' }
+    $profile = if ($Snapshot.schemaVersion -eq 2 -and $Snapshot.profile -eq 'Deep') { 'Deep' } else { 'Standard' }
+    $maxTopLevelItems = if ($profile -eq 'Deep') { 2048 } else { 512 }
+    foreach ($field in @('software', 'dev', 'editors', 'agents', 'wsl', 'dataLocations', 'unbackedDataCandidates', 'manualItems', 'configArtifacts', 'git')) {
+        $fieldValue = Get-MHField -Object $Snapshot -Name $field -Default @()
+        if (@($fieldValue).Count -gt $maxTopLevelItems) { throw 'SNAPSHOT_LIMIT' }
+    }
     foreach ($key in @('collection', 'system', 'env', 'software', 'dev', 'shell', 'editors', 'agents', 'wsl', 'dataLocations', 'unbackedDataCandidates', 'manualItems')) {
         if ($null -eq $Snapshot.PSObject.Properties[$key]) { throw 'INVALID_SNAPSHOT' }
+    }
+    if ($Snapshot.schemaVersion -eq 2) {
+        if ($Snapshot.profile -notin @('Standard', 'Deep') -or $null -eq $Snapshot.PSObject.Properties['configArtifacts'] -or $null -eq $Snapshot.PSObject.Properties['git']) { throw 'INVALID_SNAPSHOT' }
+        if (-not (Test-MHArrayShape -Value $Snapshot.configArtifacts -RequiredProperties @('id', 'domain', 'contentPolicy', 'captureState', 'restorePolicy'))) { throw 'INVALID_SNAPSHOT' }
+        if (-not (Test-MHArrayShape -Value $Snapshot.git -RequiredProperties @('id', 'state'))) { throw 'INVALID_SNAPSHOT' }
     }
     if ($null -eq $Snapshot.collection -or $null -eq $Snapshot.system -or $null -eq $Snapshot.env -or $null -eq $Snapshot.shell) { throw 'INVALID_SNAPSHOT' }
     $arrayFields = @{
@@ -118,6 +299,8 @@ function Test-MHSnapshot {
     foreach ($key in @('roots', 'excludes')) {
         $value = Get-MHField -Object $collection -Name $key
         if (-not (Test-MHArrayShape -Value $value)) { throw 'INVALID_SNAPSHOT' }
+        $maxCollectionEntries = if ($key -eq 'roots') { 32 } else { $maxTopLevelItems }
+        if (@($value).Count -gt $maxCollectionEntries) { throw 'SNAPSHOT_LIMIT' }
     }
     $domainStatus = Get-MHField -Object $collection -Name 'domainStatus'
     if ($null -eq $domainStatus) { throw 'INVALID_SNAPSHOT' }
@@ -125,13 +308,39 @@ function Test-MHSnapshot {
     if ($domainStatus -is [System.Collections.IDictionary]) { $collectorEntries = @($domainStatus.Values) }
     else { $collectorEntries = @($domainStatus.PSObject.Properties | ForEach-Object { $_.Value } | Where-Object { $null -ne $_.status }) }
     foreach ($entry in $collectorEntries) { if ($entry.status -notin $allowedCollectorStatuses) { throw 'INVALID_SNAPSHOT' } }
-    foreach ($domain in @('software', 'dev', 'editors', 'agents', 'wsl', 'dataLocations')) {
+        $validationDomains = @('software', 'dev', 'editors', 'agents', 'wsl', 'dataLocations')
+        if ($Snapshot.schemaVersion -eq 2) { $validationDomains += 'git' }
+        foreach ($domain in $validationDomains) {
         foreach ($item in @(Get-MHField -Object $Snapshot -Name $domain -Default @())) {
             if ([string]::IsNullOrWhiteSpace([string](Get-MHField -Object $item -Name 'id')) -or (Get-MHField -Object $item -Name 'state') -notin @('PRESENT', 'ABSENT', 'UNKNOWN')) { throw 'INVALID_SNAPSHOT' }
         }
     }
     foreach ($candidate in @(Get-MHField -Object $Snapshot -Name 'unbackedDataCandidates' -Default @())) {
         if ([string]::IsNullOrWhiteSpace([string](Get-MHField -Object $candidate -Name 'path')) -or (Get-MHField -Object $candidate -Name 'status') -notin @('CANDIDATE', 'CONFIRMED')) { throw 'INVALID_SNAPSHOT' }
+    }
+    if ($Snapshot.schemaVersion -eq 2) {
+        $profile = Get-MHField -Object $Snapshot -Name 'profile'
+        if ($profile -notin @('Standard', 'Deep')) { throw 'INVALID_SNAPSHOT' }
+        $collectionProfile = Get-MHField -Object $collection -Name 'profile'
+        if ($collectionProfile -ne $profile) { throw 'INVALID_SNAPSHOT' }
+        $budgets = Get-MHField -Object $collection -Name 'budgets'
+        if ($null -eq $budgets -or [int](Get-MHField -Object $budgets -Name 'globalTimeoutMs' -Default 0) -le 0 -or [int](Get-MHField -Object $budgets -Name 'maxProcessOutputBytes' -Default 0) -le 0) { throw 'INVALID_SNAPSHOT' }
+        foreach ($artifact in @(Get-MHField -Object $Snapshot -Name 'configArtifacts' -Default @())) {
+            $contentPolicy = Get-MHField -Object $artifact -Name 'contentPolicy'
+            $captureState = Get-MHField -Object $artifact -Name 'captureState'
+            $redactionStatus = Get-MHField -Object $artifact -Name 'redactionStatus'
+            $restorePolicy = Get-MHField -Object $artifact -Name 'restorePolicy'
+            if ($contentPolicy -notin @('METADATA_ONLY', 'SAFE_COPY', 'REDACTED_COPY', 'MANUAL_TRANSFER', 'NEVER_COLLECT')) { throw 'INVALID_SNAPSHOT' }
+            if ($captureState -notin @('CAPTURED', 'METADATA_ONLY', 'REVIEW_REQUIRED', 'BLOCKED', 'NOT_FOUND', 'ERROR', 'NOT_TESTED')) { throw 'INVALID_SNAPSHOT' }
+            if ($redactionStatus -notin @('NOT_REQUIRED', 'REDACTED', 'BLOCKED', 'NOT_APPLICABLE', 'NOT_TESTED')) { throw 'INVALID_SNAPSHOT' }
+            if ($restorePolicy -notin @('RESTORE', 'REVIEW', 'SKIP', 'MANUAL_TRANSFER')) { throw 'INVALID_SNAPSHOT' }
+            $artifactPath = Get-MHField -Object $artifact -Name 'artifactPath'
+            $artifactHash = Get-MHField -Object $artifact -Name 'artifactSha256'
+            if ($captureState -eq 'CAPTURED') {
+                if ([string]::IsNullOrWhiteSpace([string]$artifactPath) -or [string]::IsNullOrWhiteSpace([string]$artifactHash)) { throw 'INVALID_SNAPSHOT' }
+                if ([IO.Path]::IsPathRooted([string]$artifactPath) -or @([string]$artifactPath -split '[\\/]+' | Where-Object { $_ -eq '..' }).Count -gt 0 -or [string]$artifactHash -notmatch '^[A-Fa-f0-9]{64}$') { throw 'INVALID_SNAPSHOT' }
+            } elseif ($artifactPath -or $artifactHash) { throw 'INVALID_SNAPSHOT' }
+        }
     }
 }
 
@@ -142,7 +351,13 @@ function Get-MHCollectorStatus {
     $entry = Get-MHField -Object $statuses -Name $Domain
     $status = Get-MHField -Object $entry -Name 'status' -Default 'UNKNOWN'
     $metadata = Get-MHField -Object $entry -Name 'metadata'
-    if ($Domain -eq 'data' -and ((Get-MHField -Object $metadata -Name 'scanTruncated') -or (Get-MHField -Object $metadata -Name 'skippedRootCount' -Default 0) -gt 0)) { return 'PARTIAL' }
+    if ($Domain -eq 'config') {
+        $statuses = @(@('git', 'dev', 'editors', 'agents') | ForEach-Object { Get-MHCollectorStatus -Snapshot $Snapshot -Domain $_ })
+        if ($statuses -contains 'ERROR' -or $statuses -contains 'UNAVAILABLE' -or $statuses -contains 'UNKNOWN') { return 'UNKNOWN' }
+        if ($statuses -contains 'PARTIAL') { return 'PARTIAL' }
+        return 'OK'
+    }
+    if ($Domain -eq 'data' -and ((Get-MHField -Object $metadata -Name 'scanTruncated') -or (Get-MHField -Object $metadata -Name 'skippedRootCount' -Default 0) -gt 0 -or (Get-MHField -Object $metadata -Name 'skippedBudgetRootCount' -Default 0) -gt 0 -or (Get-MHField -Object $metadata -Name 'rootsTruncated'))) { return 'PARTIAL' }
     if ($Domain -eq 'wsl') {
         $probe = Get-MHField -Object $metadata -Name 'status'
         if ($probe -eq 'PARTIAL' -or $probe -eq 'NOT_TESTED') { return 'PARTIAL' }
@@ -161,22 +376,25 @@ function New-MHDefaultDecisions {
 
 function Test-MHDecisions {
     param([Parameter(Mandatory)]$Decisions)
+    $nodeCount = 0
+    Assert-MHDocumentValueBounds -Value $Decisions -NodeCount ([ref]$nodeCount) -ErrorCode 'DECISIONS_LIMIT'
     if ((Get-MHField -Object $Decisions -Name 'schemaVersion') -ne 1) { throw 'INVALID_DECISIONS' }
     foreach ($field in @('pathMappings', 'exclusions', 'policyOverrides', 'approvals')) {
         $property = $Decisions.PSObject.Properties[$field]
         if ($null -eq $property) { throw 'INVALID_DECISIONS' }
         $value = $property.Value
         if ($value -is [string] -or $value -is [System.Collections.IDictionary]) { throw 'INVALID_DECISIONS' }
+        if (@($value).Count -gt 4096) { throw 'DECISIONS_LIMIT' }
     }
     foreach ($override in @(Get-MHField -Object $Decisions -Name 'policyOverrides' -Default @())) {
-        if ([string]::IsNullOrWhiteSpace([string](Get-MHField -Object $override -Name 'component')) -or (Get-MHField -Object $override -Name 'restorePolicy') -notin @('RESTORE', 'REVIEW', 'SKIP')) { throw 'INVALID_DECISIONS' }
+        if ([string]::IsNullOrWhiteSpace([string](Get-MHField -Object $override -Name 'component')) -or (Get-MHField -Object $override -Name 'restorePolicy') -notin @('RESTORE', 'REVIEW', 'SKIP', 'MANUAL_TRANSFER')) { throw 'INVALID_DECISIONS' }
     }
 }
 
 function Get-MHEffectiveRestorePolicy {
     param([Parameter(Mandatory)][string]$Component, $Entry, $Decisions)
     $policy = Get-MHField -Object $Entry -Name 'restorePolicy' -Default 'REVIEW'
-    if ($policy -notin @('RESTORE', 'REVIEW', 'SKIP')) { $policy = 'REVIEW' }
+    if ($policy -notin @('RESTORE', 'REVIEW', 'SKIP', 'MANUAL_TRANSFER')) { $policy = 'REVIEW' }
     $overrides = @(Get-MHField -Object $Decisions -Name 'policyOverrides' -Default @())
     foreach ($override in $overrides) {
         if ((Get-MHField -Object $override -Name 'component') -eq $Component) { $policy = [string](Get-MHField -Object $override -Name 'restorePolicy') }
@@ -195,20 +413,31 @@ function ConvertTo-MHComparableItems {
     foreach ($item in @(Get-MHField -Object $Snapshot -Name 'agents' -Default @())) { $items += [pscustomobject]@{ domain = 'agents'; id = [string]$item.id; value = $item } }
     foreach ($item in @(Get-MHField -Object $Snapshot -Name 'wsl' -Default @())) { $items += [pscustomobject]@{ domain = 'wsl'; id = [string]$item.id; value = $item } }
     foreach ($item in @(Get-MHField -Object $Snapshot -Name 'dataLocations' -Default @())) { $items += [pscustomobject]@{ domain = 'data'; id = [string]$item.id; value = $item } }
+    foreach ($item in @(Get-MHField -Object $Snapshot -Name 'git' -Default @())) { $items += [pscustomobject]@{ domain = 'git'; id = [string]$item.id; value = $item } }
+    foreach ($artifact in @(Get-MHField -Object $Snapshot -Name 'configArtifacts' -Default @())) {
+        $normalized = [ordered]@{}
+        foreach ($property in $artifact.PSObject.Properties) { $normalized[$property.Name] = $property.Value }
+        $normalized.state = if ($artifact.captureState -eq 'CAPTURED') { 'PRESENT' } elseif ($artifact.captureState -eq 'METADATA_ONLY') { 'PRESENT' } else { 'UNKNOWN' }
+        $items += [pscustomobject]@{ domain = 'config'; id = [string]$artifact.id; value = [pscustomobject]$normalized }
+    }
     return @($items | Where-Object { $_.id })
 }
 
 function Get-MHRestoreSuggestion {
-    param([string]$Domain, $Source, $Destination, [ValidateSet('RESTORE', 'REVIEW', 'SKIP')][string]$RestorePolicy = 'REVIEW')
+    param([string]$Domain, $Source, $Destination, [ValidateSet('RESTORE', 'REVIEW', 'SKIP', 'MANUAL_TRANSFER')][string]$RestorePolicy = 'REVIEW')
     $sourceState = Get-MHField -Object $Source -Name 'state'
     $destinationState = Get-MHField -Object $Destination -Name 'state'
     if ($RestorePolicy -eq 'SKIP') { return @{ action = 'SKIP'; safety = 'AUTO'; risk = 'LOW'; reason = 'Excluded or marked SKIP in decisions.json; no restore action is planned.' } }
+    if ($RestorePolicy -eq 'MANUAL_TRANSFER') { return @{ action = 'MANUAL_TRANSFER'; safety = 'MANUAL'; risk = 'HIGH'; reason = 'This component requires a separate user-controlled transfer or reauthentication.' } }
     if ($RestorePolicy -eq 'REVIEW') { return @{ action = 'REVIEW'; safety = 'MANUAL'; risk = 'MEDIUM'; reason = 'Restore policy is REVIEW; select RESTORE or SKIP in decisions.json after reviewing this component.' } }
+    if ($Domain -eq 'config' -and $Source -and (Get-MHField -Object $Source -Name 'captureState') -ne 'CAPTURED') { return @{ action = 'REVIEW'; safety = 'MANUAL'; risk = 'MEDIUM'; reason = 'Only metadata was captured or safe redaction was blocked; select manual transfer or skip.' } }
+    if ($Domain -eq 'config' -and $Source -and $Destination -and $sourceState -eq 'PRESENT' -and $destinationState -eq 'PRESENT') { return @{ action = 'COPY'; safety = 'CONFIRM'; risk = 'MEDIUM'; reason = 'Source configuration differs; review the existing target and approve a backup-backed replacement.' } }
     if ($Domain -eq 'agents' -and $Source -and $sourceState -eq 'PRESENT') { return @{ action = 'REAUTHENTICATE'; safety = 'MANUAL'; risk = 'MEDIUM'; reason = 'Recreate settings as needed, then sign in and verify MCP connections manually.' } }
     if ($Source -and $sourceState -eq 'ABSENT' -and $Destination -and $destinationState -eq 'PRESENT') { return @{ action = 'SKIP'; safety = 'AUTO'; risk = 'LOW'; reason = 'Not selected on source; destination already has it.' } }
     if ($Source -and $sourceState -eq 'PRESENT' -and (-not $Destination -or $destinationState -eq 'ABSENT')) {
         if ($Domain -in @('software', 'dev')) { return @{ action = 'INSTALL'; safety = 'CONFIRM'; risk = 'MEDIUM'; reason = 'Present on source and absent on destination; review package and version.' } }
         if ($Domain -eq 'data') { return @{ action = 'COPY'; safety = 'MANUAL'; risk = 'HIGH'; reason = 'Source path has no mapped destination; review backup and target first.' } }
+        if ($Domain -eq 'config') { return @{ action = 'COPY'; safety = 'CONFIRM'; risk = 'MEDIUM'; reason = 'Copy the reviewed, sanitized configuration artifact to the proposed target after approval.' } }
         if ($Domain -eq 'agents') { return @{ action = 'REAUTHENTICATE'; safety = 'MANUAL'; risk = 'MEDIUM'; reason = 'Agent state is absent; recreate settings and sign in manually.' } }
         return @{ action = 'RECREATE'; safety = 'CONFIRM'; risk = 'MEDIUM'; reason = 'Present on source and absent on destination; review exact target.' }
     }
@@ -220,6 +449,8 @@ function Get-MHFingerprint {
     switch ($Domain) {
         'software' { return [pscustomobject]@{ id = (Get-MHField $Value 'id'); state = (Get-MHField $Value 'state'); version = (Get-MHField $Value 'version'); packageId = (Get-MHField $Value 'packageId'); restorePolicy = (Get-MHField $Value 'restorePolicy') } }
         'dev' { return [pscustomobject]@{ id = (Get-MHField $Value 'id'); state = (Get-MHField $Value 'state'); version = (Get-MHField $Value 'version') } }
+        'git' { return [pscustomobject]@{ id = (Get-MHField $Value 'id'); state = (Get-MHField $Value 'state'); version = (Get-MHField $Value 'version'); settings = @(Get-MHField -Object $Value -Name 'settings' -Default @()); includeRules = @(Get-MHField -Object $Value -Name 'includeRules' -Default @()); credentialHelpers = @(Get-MHField -Object $Value -Name 'credentialHelpers' -Default @()); aliases = @(Get-MHField -Object $Value -Name 'aliases' -Default @()); signing = Get-MHField -Object $Value -Name 'signing'; systemConfigState = Get-MHField -Object $Value -Name 'systemConfigState' -Default 'NOT_TESTED'; systemConfigFiles = @(Get-MHField -Object $Value -Name 'systemConfigFiles' -Default @()); systemSettings = @(Get-MHField -Object $Value -Name 'systemSettings' -Default @()); systemCredentialHelpers = @(Get-MHField -Object $Value -Name 'systemCredentialHelpers' -Default @()); systemSigning = Get-MHField -Object $Value -Name 'systemSigning'; configFiles = @(Get-MHField -Object $Value -Name 'configFiles' -Default @()); globalIgnore = Get-MHField -Object $Value -Name 'globalIgnore' } }
+        'config' { return [pscustomobject]@{ id = (Get-MHField $Value 'id'); domain = (Get-MHField $Value 'domain'); contentPolicy = (Get-MHField $Value 'contentPolicy'); captureState = (Get-MHField $Value 'captureState'); redactionStatus = (Get-MHField $Value 'redactionStatus'); artifactSha256 = (Get-MHField $Value 'artifactSha256'); targetPathCandidate = (Get-MHField $Value 'targetPathCandidate'); restorePolicy = (Get-MHField $Value 'restorePolicy'); state = (Get-MHField $Value 'state') } }
         'editors' { return [pscustomobject]@{ id = (Get-MHField $Value 'id'); state = (Get-MHField $Value 'state'); extensions = @(Get-MHField $Value 'extensions' -Default @()) } }
         'agents' {
             $files = @(Get-MHField -Object $Value -Name 'configFiles' -Default @() | ForEach-Object { [pscustomobject]@{ name = (Get-MHField -Object $_ -Name 'name'); state = (Get-MHField -Object $_ -Name 'state'); enablement = (Get-MHField -Object $_ -Name 'enablement' -Default 'UNKNOWN') } })
@@ -260,14 +491,15 @@ function New-MHDiff {
         if ($destinationValue) { $matchedDestinationKeys[$entry.domain + '|' + $destinationValue.id] = $true }
         $sourceJson = ConvertTo-Json -InputObject (Get-MHFingerprint -Domain $entry.domain -Value $entry.value) -Depth 40 -Compress
         $destinationJson = if ($destinationValue) { ConvertTo-Json -InputObject (Get-MHFingerprint -Domain $entry.domain -Value $destinationValue) -Depth 40 -Compress } else { $null }
-        if ($destinationValue -and $sourceJson -eq $destinationJson -and $entry.domain -ne 'agents') { continue }
+        $configBodiesComparable = $entry.domain -ne 'config' -or ((Get-MHField -Object $entry.value -Name 'captureState') -eq 'CAPTURED' -and (Get-MHField -Object $destinationValue -Name 'captureState') -eq 'CAPTURED')
+        if ($destinationValue -and $sourceJson -eq $destinationJson -and $entry.domain -ne 'agents' -and $configBodiesComparable) { continue }
         $suggestion = Get-MHRestoreSuggestion -Domain $entry.domain -Source $entry.value -Destination $destinationValue -RestorePolicy $restorePolicy
         $sourceCollectorStatus = Get-MHCollectorStatus -Snapshot $Source -Domain $entry.domain
         $destinationCollectorStatus = Get-MHCollectorStatus -Snapshot $Destination -Domain $entry.domain
         if ($restorePolicy -eq 'RESTORE' -and ($sourceCollectorStatus -ne 'OK' -or $destinationCollectorStatus -ne 'OK') -and $suggestion.action -ne 'SKIP') {
             $suggestion = @{ action = 'REVIEW'; safety = 'MANUAL'; risk = 'MEDIUM'; reason = ('Collector coverage is incomplete (source=' + $sourceCollectorStatus + ', destination=' + $destinationCollectorStatus + '); absence cannot be confirmed.') }
         }
-        $status = if ($restorePolicy -eq 'SKIP') { 'SKIPPED' } elseif ($restorePolicy -eq 'REVIEW' -or $suggestion.action -eq 'REVIEW') { 'REVIEW' } else { 'PLANNED' }
+        $status = if ($restorePolicy -eq 'SKIP') { 'SKIPPED' } elseif ($restorePolicy -eq 'MANUAL_TRANSFER' -or $suggestion.action -eq 'MANUAL_TRANSFER') { 'MANUAL' } elseif ($restorePolicy -eq 'REVIEW' -or $suggestion.action -eq 'REVIEW') { 'REVIEW' } else { 'PLANNED' }
         $diff += [pscustomobject]@{ component = $key; sourceState = $entry.value; destinationState = $destinationValue; desiredState = $entry.value; restorePolicy = $restorePolicy; action = $suggestion.action; risk = $suggestion.risk; safety = $suggestion.safety; reason = $suggestion.reason; preconditions = @('Review destination and target mapping'); verification = @('Re-collect destination and compare state'); status = $status }
     }
     foreach ($entry in $destinationItems) {
@@ -278,7 +510,7 @@ function New-MHDiff {
         $reason = if ($restorePolicy -eq 'SKIP') { $suggestion.reason + ' Existing destination data is retained.' } else { 'Destination-only item; keep unless the user explicitly asks to remove it.' }
         $diff += [pscustomobject]@{ component = $key; sourceState = $null; destinationState = $entry.value; desiredState = $null; restorePolicy = $restorePolicy; action = $(if ($restorePolicy -eq 'SKIP') { 'SKIP' } else { 'REVIEW' }); risk = $suggestion.risk; safety = 'MANUAL'; reason = $reason; preconditions = @(); verification = @('No removal is performed'); status = $(if ($restorePolicy -eq 'SKIP') { 'SKIPPED' } else { 'REVIEW' }) }
     }
-    return [pscustomobject]@{ schemaVersion = 1; sourceSnapshotId = $Source.snapshotId; destinationSnapshotId = $Destination.snapshotId; createdAt = [DateTimeOffset]::Now.ToString('o'); items = @($diff) }
+    return [pscustomobject]@{ schemaVersion = $(if ($Source.schemaVersion -ge 2 -and $Destination.schemaVersion -ge 2) { 2 } else { 1 }); sourceSnapshotId = $Source.snapshotId; destinationSnapshotId = $Destination.snapshotId; createdAt = [DateTimeOffset]::Now.ToString('o'); items = @($diff) }
 }
 
 function New-MHValidation {
@@ -296,6 +528,8 @@ function New-MHValidation {
         $collectorPartial = (Get-MHCollectorStatus -Snapshot $Source -Domain $domain) -eq 'PARTIAL' -or (Get-MHCollectorStatus -Snapshot $Destination -Domain $domain) -eq 'PARTIAL'
         if ($collectorFailed) { $status = 'UNKNOWN'; $evidence = 'A required collector did not produce a complete current result.' }
         elseif ($collectorPartial) { $status = 'WARN'; $evidence = 'A bounded collector reached a limit; review coverage.' }
+        elseif ($restorePolicy -eq 'MANUAL_TRANSFER' -or $item.action -eq 'MANUAL_TRANSFER') { $status = 'NOT_TESTED'; $evidence = 'Manual transfer or reauthentication is required.' }
+        elseif ($domain -eq 'config' -and ((Get-MHField -Object $item.sourceState -Name 'captureState') -ne 'CAPTURED' -or (Get-MHField -Object $item.destinationState -Name 'captureState') -ne 'CAPTURED')) { $status = 'NOT_TESTED'; $evidence = 'The config body was not safely captured on both machines.' }
         elseif ($restorePolicy -eq 'SKIP' -or $item.action -eq 'SKIP') { $status = 'WARN'; $evidence = 'Skipped by source/destination policy.' }
         elseif ($restorePolicy -eq 'REVIEW') { $status = 'WARN'; $evidence = 'Restore policy is REVIEW; this component is not selected for restoration.' }
         elseif ($item.action -eq 'REAUTHENTICATE') { $status = 'UNKNOWN'; $evidence = 'Sign-in and MCP connectivity require a separate live check.' }
@@ -331,7 +565,14 @@ function New-MHValidation {
         $secretNames = @($sourceVariables | Where-Object isSecret)
         $checks += [pscustomobject]@{ component = 'env:variables'; status = $(if (-not $envCollectorsReady) { 'UNKNOWN' } elseif ($missingNames.Count -eq 0 -and $differentSafeValues.Count -eq 0) { 'PASS' } else { 'WARN' }); checkedAt = [DateTimeOffset]::Now.ToString('o'); evidence = ('Missing names=' + $missingNames.Count + '; differing allowlisted safe values=' + $differentSafeValues.Count); nextStep = 'Review missing names and differing allowlisted values; recreate only reviewed nonsecret variables.' }
         if ($secretNames.Count -gt 0) { $checks += [pscustomobject]@{ component = 'env:secrets'; status = 'UNKNOWN'; checkedAt = [DateTimeOffset]::Now.ToString('o'); evidence = ('Secret names present on source: ' + $secretNames.Count + '; values were not collected.'); nextStep = 'Set or reauthenticate each required secret manually.' } }
-        foreach ($domain in @('system', 'software', 'dev', 'shell', 'editors', 'agents', 'wsl', 'data')) {
+        $validationDomains = @('system', 'software', 'dev', 'shell', 'editors', 'agents', 'git', 'wsl', 'data')
+        foreach ($snapshot in @($Source, $Destination)) {
+            $statusObject = Get-MHField -Object (Get-MHField -Object $snapshot -Name 'collection') -Name 'domainStatus'
+            foreach ($domain in @('workstation', 'wslDeep', 'toolchains', 'platformTools', 'containers', 'ssh', 'gpg')) {
+                if ($validationDomains -notcontains $domain -and $null -ne (Get-MHField -Object $statusObject -Name $domain)) { $validationDomains += $domain }
+            }
+        }
+        foreach ($domain in $validationDomains) {
             $sourceStatus = Get-MHCollectorStatus -Snapshot $Source -Domain $domain
             $destinationStatus = Get-MHCollectorStatus -Snapshot $Destination -Domain $domain
             if ($sourceStatus -notin @('OK', 'PARTIAL') -or $destinationStatus -notin @('OK', 'PARTIAL')) {
@@ -413,7 +654,8 @@ function New-MHValidation {
         }
     }
     if ($checks.Count -eq 0) { $checks += [pscustomobject]@{ component = 'snapshot'; status = 'UNKNOWN'; checkedAt = [DateTimeOffset]::Now.ToString('o'); evidence = 'No complete current checks were produced.'; nextStep = 'Run validation with selected components and current destination evidence.' } }
-    return [pscustomobject]@{ schemaVersion = 1; createdAt = [DateTimeOffset]::Now.ToString('o'); checks = @($checks); counts = [pscustomobject]@{ pass = @($checks | Where-Object status -eq 'PASS').Count; warn = @($checks | Where-Object status -eq 'WARN').Count; fail = @($checks | Where-Object status -eq 'FAIL').Count; unknown = @($checks | Where-Object status -eq 'UNKNOWN').Count } }
+    $diffSchemaVersion = [int](Get-MHField -Object $Diff -Name 'schemaVersion' -Default 1)
+    return [pscustomobject]@{ schemaVersion = $(if ($diffSchemaVersion -ge 2) { 2 } else { 1 }); createdAt = [DateTimeOffset]::Now.ToString('o'); checks = @($checks); counts = [pscustomobject]@{ pass = @($checks | Where-Object status -eq 'PASS').Count; warn = @($checks | Where-Object status -eq 'WARN').Count; fail = @($checks | Where-Object status -eq 'FAIL').Count; unknown = @($checks | Where-Object status -eq 'UNKNOWN').Count; notTested = @($checks | Where-Object status -eq 'NOT_TESTED').Count } }
 }
 
 function ConvertTo-MHCell {
@@ -444,7 +686,7 @@ function New-MHRows {
 }
 
 function Get-MHReportText {
-    param([Parameter(Mandatory)]$Snapshot, [Parameter(Mandatory)][string]$Name, $Diff, $Validation)
+    param([Parameter(Mandatory)]$Snapshot, [Parameter(Mandatory)][string]$Name, $Diff, $Validation, $RestorePlan)
     $software = @(Get-MHField -Object $Snapshot -Name 'software' -Default @())
     $dev = @(Get-MHField -Object $Snapshot -Name 'dev' -Default @())
     $editors = @(Get-MHField -Object $Snapshot -Name 'editors' -Default @())
@@ -461,6 +703,11 @@ function Get-MHReportText {
     $diffItems = @(Get-MHField -Object $Diff -Name 'items' -Default @())
     $validationChecks = @(Get-MHField -Object $Validation -Name 'checks' -Default @())
     $wslItems = @(Get-MHField -Object $Snapshot -Name 'wsl' -Default @())
+    $wslInventoryItems = @($wslItems | Where-Object { $_.id -ne 'wsl:deep-summary' })
+    $wslDeepSummary = @($wslItems | Where-Object id -eq 'wsl:deep-summary' | Select-Object -First 1)
+    $toolchainDetails = @($dev | Where-Object { $_.id -in @('rust', 'java', 'go', 'native', 'visual-studio') })
+    $platformDetails = @($dev | Where-Object { $_.id -like 'platform:*' })
+    $jetBrainsDetails = @($editors | Where-Object id -eq 'editors:jetbrains')
     $collectionRoots = @(Get-MHField -Object $collection -Name 'roots' -Default @())
     $collectedAt = Get-MHField -Object $Snapshot -Name 'collectedAt' -Default 'UNKNOWN'
     $hostLabel = Get-MHField -Object $system -Name 'computerLabel' -Default 'UNKNOWN'
@@ -468,9 +715,17 @@ function Get-MHReportText {
         'HANDOFF.md' {
             $templatePath = Join-Path $PSScriptRoot '..\assets\HANDOFF.template.md'
             $content = Get-Content -LiteralPath $templatePath -Raw -Encoding UTF8
-            $toolSummary = (@($dev | Where-Object state -eq 'PRESENT' | ForEach-Object { $_.id + ' ' + $_.version }) -join ', ')
+            $toolSummary = (@($dev | Where-Object state -eq 'PRESENT' | ForEach-Object {
+                $version = [string](Get-MHField -Object $_ -Name 'version' -Default '')
+                if ($version) { [string]$_.id + ' ' + $version } else { [string]$_.id + ' (present)' }
+            }) -join ', ')
             $agentSummary = (@($agents | Where-Object state -eq 'PRESENT' | ForEach-Object { $_.id }) -join ', ')
-            $wslSummary = (@($wslItems | ForEach-Object { $_.name + ' (WSL ' + $_.version + ')' }) -join ', ')
+            $wslSummary = (@($wslInventoryItems | ForEach-Object {
+                $name = [string](Get-MHField -Object $_ -Name 'name' -Default (Get-MHField -Object $_ -Name 'id' -Default 'WSL'))
+                $version = Get-MHField -Object $_ -Name 'version'
+                if ($null -ne $version) { $name + ' (WSL ' + $version + ')' } else { $name }
+            }) -join ', ')
+            if ($wslDeepSummary.Count -gt 0 -and $wslDeepSummary[0].defaultDistribution) { $wslSummary += $(if ($wslSummary) { ', ' } else { '' }) + 'default=' + [string]$wslDeepSummary[0].defaultDistribution }
             $pathSummary = (@($data | ForEach-Object { $_.type + ': ' + $_.sourcePath }) -join '; ')
             $candidateSummary = (@($candidates | ForEach-Object { $_.path + ' — ' + $_.reason }) -join '; ')
             $windows = if ($system) { $system.windows.productName + ' build ' + $system.windows.build } else { 'UNKNOWN' }
@@ -502,12 +757,14 @@ function Get-MHReportText {
             return "# 软件清单`n`nwinget 状态：$wingetStatus`n`n软件策略默认为 REVIEW，由 Agent 与用户确认是否保留。`n`n$(Write-MHTable -Headers @('软件', '版本', '来源', '分类', '策略', '标识') -Rows $rows)"
         }
         'DEVELOPMENT.md' {
-            $toolRows = New-MHRows -Items $dev -Selector { param($item) @($item.id, $item.state, $item.version, $item.path, $item.status) }
-            $editorRows = New-MHRows -Items $editors -Selector { param($item) @($item.id, $item.state, $item.path, (@(Get-MHField -Object $item -Name 'extensions' -Default @()) -join ', '), (@((Get-MHField -Object $item -Name 'profiles' -Default @()) | ForEach-Object { $_.name }) -join ', '), (@((Get-MHField -Object $item -Name 'configFiles' -Default @()) | ForEach-Object { $_.name }) -join ', '), (Get-MHField -Object $item -Name 'launchStatus') ) }
-            $wslRows = New-MHRows -Items $wslItems -Selector { param($item) @($item.name, $item.version, $item.running, $item.configState, $item.restorePolicy) }
+            $toolRows = New-MHRows -Items $dev -Selector { param($item) @((Get-MHField -Object $item -Name 'id'), (Get-MHField -Object $item -Name 'state'), (Get-MHField -Object $item -Name 'version'), (Get-MHField -Object $item -Name 'path'), (Get-MHField -Object $item -Name 'status')) }
+            $editorRows = New-MHRows -Items $editors -Selector { param($item) @((Get-MHField -Object $item -Name 'id'), (Get-MHField -Object $item -Name 'state'), (Get-MHField -Object $item -Name 'path'), (@(Get-MHField -Object $item -Name 'extensions' -Default @()) -join ', '), (@((Get-MHField -Object $item -Name 'profiles' -Default @()) | ForEach-Object { $_.name }) -join ', '), (@((Get-MHField -Object $item -Name 'configFiles' -Default @()) | ForEach-Object { $_.name }) -join ', '), (Get-MHField -Object $item -Name 'launchStatus')) }
+            $wslRows = New-MHRows -Items $wslInventoryItems -Selector { param($item) @((Get-MHField -Object $item -Name 'name'), (Get-MHField -Object $item -Name 'version'), (Get-MHField -Object $item -Name 'running'), (Get-MHField -Object $item -Name 'configState'), (Get-MHField -Object $item -Name 'restorePolicy')) }
             $globalConfig = @($wslItems | Where-Object id -eq 'wsl:global-config' | Select-Object -First 1)
             $wslSettings = if ($globalConfig.Count -gt 0) { ConvertTo-Json -InputObject $globalConfig[0].safeSettings -Depth 10 -Compress } else { '[]' }
-            return "# 开发环境`n`n## 工具链`n`n$(Write-MHTable -Headers @('工具', '状态', '版本', '路径', '检测') -Rows $toolRows)`n`n## 编辑器`n`n$(Write-MHTable -Headers @('编辑器', '状态', '路径', '扩展', 'profiles', '配置文件', '启动检查') -Rows $editorRows)`n`n## WSL`n`n$(Write-MHTable -Headers @('发行版', '版本', '运行中', '配置', '策略') -Rows $wslRows)`n`n安全配置摘要：$wslSettings"
+            $deepDetails = [pscustomobject]@{ toolchains = $toolchainDetails; platformTools = $platformDetails; jetBrains = $jetBrainsDetails; wslDeep = if ($wslDeepSummary.Count -gt 0) { $wslDeepSummary[0] } else { $null } }
+            $deepDetailsJson = ConvertTo-Json -InputObject $deepDetails -Depth 40
+            return "# 开发环境`n`n## 工具链`n`n$(Write-MHTable -Headers @('工具', '状态', '版本', '路径', '检测') -Rows $toolRows)`n`n## 编辑器`n`n$(Write-MHTable -Headers @('编辑器', '状态', '路径', '扩展', 'profiles', '配置文件', '启动检查') -Rows $editorRows)`n`n## WSL`n`n$(Write-MHTable -Headers @('发行版', '版本', '运行中', '配置', '策略') -Rows $wslRows)`n`n安全配置摘要：$wslSettings`n`n## v1.6 深度采集元数据`n`n~~~json`n$deepDetailsJson`n~~~"
         }
         'AI_AGENTS.md' {
             $agentRows = New-MHRows -Items $agents -Selector { param($item) @($item.id, $item.state, (Get-MHField -Object $item -Name 'cliName'), (Get-MHField -Object $item -Name 'cliPath'), (@(Get-MHField -Object $item -Name 'configPaths' -Default @()) -join ', '), (Get-MHField -Object $item -Name 'terminalIntegration' -Default 'UNKNOWN'), (Get-MHField -Object $item -Name 'auth' -Default 'REAUTHENTICATE')) }
@@ -524,17 +781,20 @@ function Get-MHReportText {
         'MIGRATION_PLAN.md' {
             $diffRows = New-MHRows -Items $diffItems -Selector { param($item) @($item.component, $item.action, $item.risk, $item.safety, $item.status, $item.reason) }
             $validationRows = New-MHRows -Items $validationChecks -Selector { param($item) @($item.component, $item.status, $item.evidence, $item.nextStep) }
-            return "# 迁移计划`n`n本计划不执行安装、覆盖、复制、同步或 WSL 导入。先审核动作、目标与风险，再逐项授权。`n`n## 差异`n`n$(Write-MHTable -Headers @('组件', '动作', '风险', '门槛', '状态', '原因') -Rows $diffRows)`n`n## 验证`n`n$(Write-MHTable -Headers @('组件', '状态', '证据', '下一步') -Rows $validationRows)"
+            $restoreActions = @(Get-MHField -Object $RestorePlan -Name 'actions' -Default @())
+            $restoreRows = New-MHRows -Items $restoreActions -Selector { param($item) @((Get-MHField -Object $item -Name 'actionId'), (Get-MHField -Object $item -Name 'componentId'), (Get-MHField -Object $item -Name 'actionType'), (Get-MHField -Object $item -Name 'status'), (Get-MHField -Object $item -Name 'targetPath'), (Get-MHField -Object $item -Name 'backupPath'), (Get-MHField -Object $item -Name 'reason')) }
+            $planSummary = if ($RestorePlan) { 'Plan status: ' + [string]$RestorePlan.status + '; plan SHA-256: ' + [string]$RestorePlan.planSha256 } else { 'No restore plan was generated by this mode.' }
+            return "# 迁移计划`n`n$planSummary`nv2.0 默认只生成计划。仅当用户重跑命令并提交当前计划 SHA-256 与指定 action ID 时，白名单执行器才会复制已捕获的 SAFE_COPY/REDACTED_COPY 工件；目标已存在时先备份再替换，并在执行后重新采集和验证。软件安装、Git 修改、Profile/Hooks 执行、密钥导入、WSL 导入和 Docker volume 操作仍不会执行。`n`n## Restore actions`n`n$(Write-MHTable -Headers @('Action ID', '组件', '类型', '状态', '目标', '备份路径', '原因') -Rows $restoreRows)`n`n## 差异`n`n$(Write-MHTable -Headers @('组件', '动作', '风险', '门槛', '状态', '原因') -Rows $diffRows)`n`n## 验证`n`n$(Write-MHTable -Headers @('组件', '状态', '证据', '下一步') -Rows $validationRows)"
         }
     }
     throw 'UNKNOWN_REPORT'
 }
 
 function New-MHReportTexts {
-    param([Parameter(Mandatory)]$Snapshot, $Diff, $Validation)
+    param([Parameter(Mandatory)]$Snapshot, $Diff, $Validation, $RestorePlan)
     $reports = [ordered]@{}
     foreach ($name in @('HANDOFF.md', 'SYSTEM.md', 'SOFTWARE.md', 'DEVELOPMENT.md', 'AI_AGENTS.md', 'DATA.md', 'MIGRATION_PLAN.md')) {
-        $text = Get-MHReportText -Snapshot $Snapshot -Name $name -Diff $Diff -Validation $Validation
+        $text = Get-MHReportText -Snapshot $Snapshot -Name $name -Diff $Diff -Validation $Validation -RestorePlan $RestorePlan
         Test-MHSerializedText -Text $text
         $reports[$name] = $text
     }
@@ -542,8 +802,8 @@ function New-MHReportTexts {
 }
 
 function Write-MHReports {
-    param([Parameter(Mandatory)][string]$PackagePath, [Parameter(Mandatory)]$Snapshot, $Diff, $Validation, $ReportTexts)
-    if ($null -eq $ReportTexts) { $ReportTexts = New-MHReportTexts -Snapshot $Snapshot -Diff $Diff -Validation $Validation }
+    param([Parameter(Mandatory)][string]$PackagePath, [Parameter(Mandatory)]$Snapshot, $Diff, $Validation, $RestorePlan, $ReportTexts)
+    if ($null -eq $ReportTexts) { $ReportTexts = New-MHReportTexts -Snapshot $Snapshot -Diff $Diff -Validation $Validation -RestorePlan $RestorePlan }
     foreach ($name in @('HANDOFF.md', 'SYSTEM.md', 'SOFTWARE.md', 'DEVELOPMENT.md', 'AI_AGENTS.md', 'DATA.md', 'MIGRATION_PLAN.md')) {
         Write-MHAtomicText -Path (Join-Path $PackagePath $name) -Text $ReportTexts[$name]
     }

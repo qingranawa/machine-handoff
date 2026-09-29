@@ -3,7 +3,7 @@
 $script:MHPathVariables = @('CARGO_HOME', 'DOTNET_ROOT', 'DOTNET_ROOT_X64', 'GOPATH', 'GOROOT', 'JAVA_HOME', 'NVM_HOME', 'PNPM_HOME', 'PYTHONHOME', 'RUSTUP_HOME', 'VIRTUAL_ENV')
 $script:MHSecretName = '(?i)(API[_-]?KEY|TOKEN|SECRET|PASSWORD|PASSWD|COOKIE|CREDENTIAL|AUTHORIZATION|BITLOCKER|PRIVATE[_-]?KEY)'
 $script:MHSecretValue = @(
-    '(?i)["'']?(?:api[ _-]?key|access[ _-]?token|refresh[ _-]?token|password|passwd|client_secret|authorization|cookie|private[ _-]?key|bitlocker[ _-]?key)\s*["'']?\s*[:=]\s*["'']?[^"''\s,;\}\]]+',
+    '(?i)["'']?(?:api[ _-]?key|access[ _-]?token|refresh[ _-]?token|password|passwd|pwd|username|user[ _-]?id|uid|client_secret|authorization|cookie|private[ _-]?key|bitlocker[ _-]?key)\s*["'']?\s*[:=]\s*["'']?[^"''\s,;\}\]]+',
     '(?i)\bbearer\s+[A-Za-z0-9._~+/-]{12,}',
     '(?i)://[^/\s:@]+:[^/\s@]+@',
     '\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16})\b',
@@ -34,80 +34,9 @@ function ConvertTo-MHSafePath {
     return $safePath.TrimEnd('\')
 }
 
-function ConvertTo-MHWindowsArgument {
-    param([Parameter(Mandatory)][string]$Argument)
-    if ($Argument -notmatch '[\s"]') { return $Argument }
-    $builder = New-Object System.Text.StringBuilder
-    [void]$builder.Append('"')
-    $slashes = 0
-    foreach ($character in $Argument.ToCharArray()) {
-        if ($character -eq '\') {
-            $slashes++
-            continue
-        }
-        if ($character -eq '"') {
-            [void]$builder.Append(('\' * (2 * $slashes + 1)))
-            [void]$builder.Append('"')
-            $slashes = 0
-            continue
-        }
-        [void]$builder.Append(('\' * $slashes))
-        [void]$builder.Append($character)
-        $slashes = 0
-    }
-    [void]$builder.Append(('\' * (2 * $slashes)))
-    [void]$builder.Append('"')
-    return $builder.ToString()
-}
-
-function Invoke-MHSafeProcess {
-    param(
-        [Parameter(Mandatory)][string]$Name,
-        [string[]]$Arguments = @(),
-        [int]$TimeoutMilliseconds = 5000
-    )
-    $command = Get-Command -Name $Name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($null -eq $command) { return [pscustomobject]@{ found = $false; exitCode = $null; timedOut = $false; stdout = ''; errorCode = 'NOT_FOUND' } }
-
-    $process = New-Object System.Diagnostics.Process
-    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
-    $startInfo.FileName = $command.Source
-    $startInfo.Arguments = (($Arguments | ForEach-Object { ConvertTo-MHWindowsArgument -Argument $_ }) -join ' ')
-    $startInfo.UseShellExecute = $false
-    $startInfo.CreateNoWindow = $true
-    $startInfo.RedirectStandardOutput = $true
-    $startInfo.RedirectStandardError = $true
-    $startInfo.EnvironmentVariables['GIT_OPTIONAL_LOCKS'] = '0'
-    $startInfo.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
-    $startInfo.StandardErrorEncoding = [System.Text.UTF8Encoding]::new($false)
-    $process.StartInfo = $startInfo
-
-    try {
-        if (-not $process.Start()) { return [pscustomobject]@{ found = $true; exitCode = $null; timedOut = $false; stdout = ''; errorCode = 'START_FAILED' } }
-        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
-        $stderrTask = $process.StandardError.ReadToEndAsync()
-        if (-not $process.WaitForExit($TimeoutMilliseconds)) {
-            try { $process.Kill() } catch { }
-            return [pscustomobject]@{ found = $true; exitCode = $null; timedOut = $true; stdout = ''; errorCode = 'TIMEOUT' }
-        }
-        $process.WaitForExit()
-        $output = $stdoutTask.GetAwaiter().GetResult()
-        $errorOutput = $stderrTask.GetAwaiter().GetResult()
-        if ($output.Length -gt 131072) { $output = $output.Substring(0, 131072) }
-        if ($errorOutput.Length -gt 131072) { $errorOutput = $errorOutput.Substring(0, 131072) }
-        return [pscustomobject]@{ found = $true; exitCode = $process.ExitCode; timedOut = $false; stdout = ($output + "`n" + $errorOutput).Replace("`0", ''); errorCode = $null }
-    }
-    catch {
-        return [pscustomobject]@{ found = $true; exitCode = $null; timedOut = $false; stdout = ''; errorCode = 'COMMAND_FAILED' }
-    }
-    finally {
-        $process.Dispose()
-    }
-}
-
 function Get-MHVersionFact {
-    param([string]$Name, [string[]]$Arguments = @('--version'), [string]$VersionPattern = '(?i)(?<![\w])v?\d+(?:\.\d+){1,3}(?:[-+][\w.-]+)?')
-    $result = Invoke-MHSafeProcess -Name $Name -Arguments $Arguments
+    param([string]$Name, [string[]]$Arguments = @('--version'), [string]$VersionPattern = '(?i)(?<![\w])v?\d+(?:\.\d+){1,3}(?:[-+][\w.-]+)?', $Context)
+    $result = Invoke-MHSafeProcess -Name $Name -Arguments $Arguments -Context $Context
     if (-not $result.found) { return [pscustomobject]@{ id = $Name; state = 'ABSENT'; status = 'NOT_FOUND'; version = $null; path = $null } }
     if ($result.timedOut) { return [pscustomobject]@{ id = $Name; state = 'UNKNOWN'; status = 'TIMEOUT'; version = $null; path = $null } }
     if ($result.errorCode) { return [pscustomobject]@{ id = $Name; state = 'UNKNOWN'; status = $result.errorCode; version = $null; path = $null } }
@@ -224,7 +153,7 @@ function Get-MHUninstallFacts {
 }
 
 function Get-MHWingetFacts {
-    param([switch]$SafeMode)
+    param([switch]$SafeMode, $Context)
     $winget = Get-Command -Name 'winget.exe' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $winget) { return [pscustomobject]@{ state = 'ABSENT'; status = 'NOT_FOUND'; packages = @() } }
     if ($SafeMode) { return [pscustomobject]@{ state = 'PRESENT'; status = 'NOT_TESTED'; packages = @() } }
@@ -233,11 +162,13 @@ function Get-MHWingetFacts {
     $manifestPath = Join-Path $tempRoot 'winget-export.json'
     try {
         [void](New-Item -ItemType Directory -Path $tempRoot -ErrorAction Stop)
-        $result = Invoke-MHSafeProcess -Name 'winget.exe' -Arguments @('export', '--output', $manifestPath, '--disable-interactivity') -TimeoutMilliseconds 30000
+        $result = Invoke-MHSafeProcess -Name 'winget.exe' -Arguments @('export', '--output', $manifestPath, '--disable-interactivity') -TimeoutMilliseconds 30000 -Context $Context
         if (-not $result.found -or $result.timedOut -or $result.errorCode -or $result.exitCode -ne 0 -or -not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
             return [pscustomobject]@{ state = 'PRESENT'; status = 'EXPORT_UNAVAILABLE'; packages = @() }
         }
-        $data = Get-Content -LiteralPath $manifestPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        $maxExportBytes = [long](Get-MHField -Object (Get-MHField -Object $Context -Name 'budgets') -Name 'maxPackageBytes' -Default 10485760)
+        $manifestText = Read-MHBoundedUtf8Text -Path $manifestPath -MaxBytes $maxExportBytes
+        $data = ConvertFrom-Json -InputObject $manifestText -ErrorAction Stop
         $packages = @()
         foreach ($package in @($data.Packages)) {
             $id = [string]$package.PackageIdentifier
@@ -255,9 +186,9 @@ function Get-MHWingetFacts {
 }
 
 function Get-MHSoftwareFacts {
-    param([switch]$SafeMode, [string[]]$Roots = @())
+    param([switch]$SafeMode, [string[]]$Roots = @(), $Context)
     $arp = @(Get-MHUninstallFacts)
-    $winget = Get-MHWingetFacts -SafeMode:$SafeMode
+    $winget = Get-MHWingetFacts -SafeMode:$SafeMode -Context $Context
     $packages = @($arp + @($winget.packages) | Sort-Object id -Unique)
     foreach ($root in $Roots) {
         if ((Split-Path -Leaf $root) -notmatch '(?i)^(PortableApps|Portable|Apps)$') { continue }
@@ -275,6 +206,7 @@ function Get-MHSoftwareFacts {
 }
 
 function Get-MHDevFacts {
+    param($Context)
     $tools = @(
         @{ name = 'git'; args = @('--version') }, @{ name = 'node'; args = @('--version') },
         @{ name = 'npm'; args = @('--version') }, @{ name = 'pnpm'; args = @('--version') },
@@ -287,23 +219,25 @@ function Get-MHDevFacts {
         @{ name = 'cmake'; args = @('--version') }, @{ name = 'pwsh'; args = @('--version') }
     )
     $items = @()
-    foreach ($tool in $tools) { $items += Get-MHVersionFact -Name $tool.name -Arguments $tool.args }
+    foreach ($tool in $tools) { $items += Get-MHVersionFact -Name $tool.name -Arguments $tool.args -Context $Context }
     $items += [pscustomobject]@{ id = 'powershell'; state = 'PRESENT'; status = 'OK'; version = $PSVersionTable.PSVersion.ToString(); path = (Get-Process -Id $PID).Path }
     return @($items)
 }
 
 function Get-MHShellFacts {
+    param($Context)
     $terminalSettings = Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState\settings.json'
     $profile = $PROFILE.CurrentUserAllHosts
     $facts = @(
         [pscustomobject]@{ id = 'windows-terminal-settings'; state = $(if (Test-Path -LiteralPath $terminalSettings) { 'PRESENT' } else { 'ABSENT' }); path = (ConvertTo-MHSafePath -Path $terminalSettings) },
         [pscustomobject]@{ id = 'powershell-profile'; state = $(if (Test-Path -LiteralPath $profile) { 'PRESENT' } else { 'ABSENT' }); path = (ConvertTo-MHSafePath -Path $profile) }
     )
-    $command = Get-MHVersionFact -Name 'wt.exe' -Arguments @('--version')
+    $command = Get-MHVersionFact -Name 'wt.exe' -Arguments @('--version') -Context $Context
     return [pscustomobject]@{ id = 'shell'; state = 'PRESENT'; currentPowerShell = $PSVersionTable.PSVersion.ToString(); terminal = $command; config = $facts }
 }
 
 function Get-MHEditorFacts {
+    param($Context)
     $items = @()
     $definitions = @(
         @{ id = 'vscode'; commands = @('code.exe', 'code.cmd', 'code'); extensionPath = (Join-Path $env:USERPROFILE '.vscode\extensions'); userPath = (Join-Path $env:APPDATA 'Code\User') },
@@ -435,30 +369,40 @@ function ConvertTo-MHSafeWslSettings {
 }
 
 function Get-MHWslFacts {
-    param([switch]$SafeMode)
+    param([switch]$SafeMode, $Context)
     $wsl = Get-Command -Name 'wsl.exe' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    $configPath = Join-Path $env:USERPROFILE '.wslconfig'
-    $hasConfig = Test-Path -LiteralPath $configPath -PathType Leaf
+    $wslProfile = [string](Get-MHField -Object $Context -Name 'userProfile' -Default $env:USERPROFILE)
+    $isUncProfile = $wslProfile.StartsWith('\\', [StringComparison]::Ordinal)
+    $configPath = if ($wslProfile -and -not $isUncProfile) { Join-Path $wslProfile '.wslconfig' } else { $null }
+    $configState = if ($isUncProfile) { 'UNKNOWN' } else { 'ABSENT' }
     $safeSettings = @()
-    if ($hasConfig) {
+    if ($configPath -and (Test-Path -LiteralPath $configPath -PathType Leaf)) {
         $allowed = 'memory|processors|swap|localhostForwarding|dnsTunneling|networkingMode|guiApplications'
         try {
-            foreach ($line in Get-Content -LiteralPath $configPath -Encoding UTF8 -ErrorAction Stop) {
+            [void](Assert-MHNoReparseAncestors -Path $configPath)
+            $configFile = Get-Item -LiteralPath $configPath -Force -ErrorAction Stop
+            if (($configFile.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'PATH_REPARSE_BLOCKED' }
+            $maxConfigBytes = [long](Get-MHField -Object $Context.budgets -Name 'maxConfigBytes' -Default 262144)
+            if ([long]$configFile.Length -gt $maxConfigBytes) { throw 'CONFIG_SIZE_LIMIT' }
+            $configText = Read-MHBoundedUtf8Text -Path $configPath -MaxBytes $maxConfigBytes
+            foreach ($line in ($configText -split "`r?`n")) {
                 if ($line -match "^\s*(?<key>$allowed)\s*=\s*(?<value>[^;#\s]+)\s*$") {
                     $settingName = $Matches.key
                     $settingValue = $Matches.value
-                    if ($settingValue -match '(?i)^(?:true|false|\d+(?:\.\d+)?[KMG]?|nat|mirrored|virtioproxy)$') {
+                    if ($settingValue -match '(?i)^(?:true|false|\d+(?:\.\d+)?(?:KB?|MB?|GB?)?|nat|mirrored|virtioproxy)$') {
                         $safeSettings += [pscustomobject]@{ name = $settingName; value = $settingValue }
                     }
                 }
             }
-        } catch { $safeSettings = @() }
+            $configState = 'PRESENT'
+        } catch { $safeSettings = @(); $configState = 'UNKNOWN' }
     }
-    $globalConfig = [pscustomobject]@{ id = 'wsl:global-config'; name = '.wslconfig'; state = $(if ($hasConfig) { 'PRESENT' } else { 'ABSENT' }); version = $null; running = $null; configPath = $(if ($hasConfig) { ConvertTo-MHSafePath -Path $configPath } else { $null }); configState = $(if ($hasConfig) { 'PRESENT' } else { 'ABSENT' }); safeSettings = @($safeSettings); restorePolicy = 'REVIEW' }
+    $hasConfig = $configState -ne 'ABSENT'
+    $globalConfig = [pscustomobject]@{ id = 'wsl:global-config'; name = '.wslconfig'; state = $(if ($configState -eq 'ABSENT') { 'ABSENT' } elseif ($configState -eq 'PRESENT') { 'PRESENT' } else { 'UNKNOWN' }); version = $null; running = $null; configPath = $(if ($hasConfig) { ConvertTo-MHSafePath -Path $configPath } else { $null }); configState = $configState; safeSettings = @($safeSettings); restorePolicy = 'REVIEW' }
     if (-not $wsl) { return [pscustomobject]@{ id = 'wsl'; state = 'ABSENT'; status = 'NOT_FOUND'; configPath = $globalConfig.configPath; configState = $globalConfig.configState; safeSettings = @($safeSettings); items = @($globalConfig) } }
     if ($SafeMode) { return [pscustomobject]@{ id = 'wsl'; state = 'PRESENT'; status = 'NOT_TESTED'; configPath = $globalConfig.configPath; configState = $globalConfig.configState; safeSettings = @($safeSettings); items = @($globalConfig) } }
-    $verboseResult = Invoke-MHSafeProcess -Name 'wsl.exe' -Arguments @('--list', '--verbose') -TimeoutMilliseconds 10000
-    $quietResult = Invoke-MHSafeProcess -Name 'wsl.exe' -Arguments @('--list', '--quiet') -TimeoutMilliseconds 10000
+    $verboseResult = Invoke-MHSafeProcess -Name 'wsl.exe' -Arguments @('--list', '--verbose') -TimeoutMilliseconds 10000 -Context $Context
+    $quietResult = Invoke-MHSafeProcess -Name 'wsl.exe' -Arguments @('--list', '--quiet') -TimeoutMilliseconds 10000 -Context $Context
     $verboseReady = -not $verboseResult.errorCode -and -not $verboseResult.timedOut -and $verboseResult.exitCode -eq 0
     $quietReady = -not $quietResult.errorCode -and -not $quietResult.timedOut -and $quietResult.exitCode -eq 0
     if (-not $verboseReady -and -not $quietReady) {
@@ -500,7 +444,7 @@ function Get-MHWslFacts {
         } else { $partial = $true }
         if ($isRunning -eq $false) { $configState = 'NOT_TESTED_NOT_RUNNING' }
         elseif ($isRunning -eq $true) {
-            $configResult = Invoke-MHSafeProcess -Name 'wsl.exe' -Arguments @('-d', $name, '--', 'cat', '/etc/wsl.conf') -TimeoutMilliseconds 8000
+            $configResult = Invoke-MHSafeProcess -Name 'wsl.exe' -Arguments @('-d', $name, '--', 'cat', '/etc/wsl.conf') -TimeoutMilliseconds 8000 -Context $Context
             if ($configResult.exitCode -eq 0 -and -not $configResult.timedOut -and -not $configResult.errorCode) { $configState = 'PRESENT'; $configSettings = @(ConvertTo-MHSafeWslSettings -Text $configResult.stdout) }
             else { $configState = 'UNKNOWN' }
         }
@@ -511,53 +455,68 @@ function Get-MHWslFacts {
 }
 
 function Get-MHDataRoots {
-    param([string]$UserHome, [string[]]$Roots, [switch]$SkipDefaultRoots)
+    param([string]$UserHome, [string[]]$Roots, [switch]$SkipDefaultRoots, [int]$MaxRoots = 16)
     $candidates = @()
+    $candidates += $Roots
     if (-not $SkipDefaultRoots) {
         $candidates += (Join-Path $UserHome 'Documents'), (Join-Path $UserHome 'Desktop')
         foreach ($name in @('Projects', 'Source', 'Repos', 'workspace', 'dev')) { $candidates += (Join-Path $UserHome $name) }
         $candidates += (Join-Path $UserHome 'Documents\Obsidian Vault')
     }
-    $candidates += $Roots
     $selected = @()
     $skippedReparseCount = 0
-    foreach ($candidate in @($candidates | Where-Object { $_ } | Sort-Object -Unique)) {
+    $skippedBudgetCount = 0
+    $seen = @{}
+    foreach ($candidate in @($candidates | Where-Object { $_ })) {
         try {
             $fullPath = [IO.Path]::GetFullPath($candidate)
+            if ($seen.ContainsKey($fullPath.ToLowerInvariant())) { continue }
+            $seen[$fullPath.ToLowerInvariant()] = $true
             [void](Assert-MHNoReparseAncestors -Path $fullPath)
             $item = Get-Item -LiteralPath $fullPath -Force -ErrorAction Stop
             if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or (Test-MHSecretText -Text $fullPath)) { continue }
+            if ($selected.Count -ge $MaxRoots) { $skippedBudgetCount++; continue }
             $selected += $fullPath
         } catch { if ($_.Exception.Message -eq 'PATH_REPARSE_BLOCKED') { $skippedReparseCount++ } }
     }
-    return [pscustomobject]@{ roots = @($selected | Sort-Object -Unique); skippedReparseCount = $skippedReparseCount }
+    return [pscustomobject]@{ roots = @($selected); skippedReparseCount = $skippedReparseCount; skippedBudgetCount = $skippedBudgetCount }
 }
 
 function Get-MHGitFact {
-    param([Parameter(Mandatory)][string]$Path)
-    $status = Invoke-MHSafeProcess -Name 'git.exe' -Arguments @('-C', $Path, 'status', '--porcelain=v1', '--branch', '--untracked-files=all')
+    param([Parameter(Mandatory)][string]$Path, $Context)
+    $fsmonitor = Invoke-MHSafeProcess -Name 'git.exe' -Arguments @('-C', $Path, 'config', '--get', 'core.fsmonitor') -Context $Context
+    if (-not $fsmonitor.found -or $fsmonitor.timedOut -or $fsmonitor.errorCode -or ($fsmonitor.exitCode -ne 0 -and $fsmonitor.exitCode -ne 1)) {
+        return [pscustomobject]@{ checked = $false; errorCode = 'GIT_FSMONITOR_CONFIG_UNAVAILABLE'; dirtyCount = $null; untrackedCount = $null; branch = $null; upstream = 'UNKNOWN'; ahead = $null; behind = $null }
+    }
+    if ($fsmonitor.exitCode -eq 0) {
+        $fsmonitorValue = [string]$fsmonitor.stdout
+        if ($fsmonitorValue.Trim() -and $fsmonitorValue.Trim() -notin @('false', 'no', 'off', '0')) {
+            return [pscustomobject]@{ checked = $false; errorCode = 'GIT_FSMONITOR_HOOK_SKIPPED'; dirtyCount = $null; untrackedCount = $null; branch = $null; upstream = 'UNKNOWN'; ahead = $null; behind = $null }
+        }
+    }
+    $status = Invoke-MHSafeProcess -Name 'git.exe' -Arguments @('-C', $Path, 'status', '--porcelain=v1', '--branch', '--untracked-files=all') -Context $Context
     if (-not $status.found) { return [pscustomobject]@{ checked = $false; errorCode = 'NOT_FOUND'; dirtyCount = $null; untrackedCount = $null; branch = $null; upstream = 'UNKNOWN'; ahead = $null; behind = $null } }
-    if ($status.exitCode -ne 0 -or $status.timedOut) { return [pscustomobject]@{ checked = $false; errorCode = 'GIT_STATUS_UNAVAILABLE'; dirtyCount = $null; untrackedCount = $null; branch = $null; upstream = 'UNKNOWN'; ahead = $null; behind = $null } }
+    if ($status.exitCode -ne 0 -or $status.timedOut -or $status.errorCode) { return [pscustomobject]@{ checked = $false; errorCode = 'GIT_STATUS_UNAVAILABLE'; dirtyCount = $null; untrackedCount = $null; branch = $null; upstream = 'UNKNOWN'; ahead = $null; behind = $null } }
     $lines = @($status.stdout -split "`r?`n" | Where-Object { $_ })
     $header = @($lines | Where-Object { $_ -match '^## ' } | Select-Object -First 1)
     $branch = $null
     $ahead = $null
     $behind = $null
-    $branchResult = Invoke-MHSafeProcess -Name 'git.exe' -Arguments @('-C', $Path, 'branch', '--show-current')
-    if ($branchResult.exitCode -eq 0 -and $branchResult.stdout.Trim() -match '^[A-Za-z0-9._/-]{1,200}$') { $branch = $branchResult.stdout.Trim() }
+    $branchResult = Invoke-MHSafeProcess -Name 'git.exe' -Arguments @('-C', $Path, 'branch', '--show-current') -Context $Context
+    if ($branchResult.exitCode -eq 0 -and -not $branchResult.errorCode -and -not $branchResult.timedOut -and $branchResult.stdout.Trim() -match '^[A-Za-z0-9._/-]{1,200}$') { $branch = $branchResult.stdout.Trim() }
     if ($header.Count -gt 0 -and $header[0] -match '\[ahead (?<ahead>\d+), behind (?<behind>\d+)\]') { $ahead = [int]$Matches.ahead; $behind = [int]$Matches.behind }
     elseif ($header.Count -gt 0 -and $header[0] -match '\[ahead (?<ahead>\d+)\]') { $ahead = [int]$Matches.ahead; $behind = 0 }
     elseif ($header.Count -gt 0 -and $header[0] -match '\[behind (?<behind>\d+)\]') { $ahead = 0; $behind = [int]$Matches.behind }
     $changes = @($lines | Where-Object { $_ -notmatch '^## ' })
     $untracked = @($changes | Where-Object { $_.StartsWith('??') }).Count
     $dirty = $changes.Count - $untracked
-    $remote = Invoke-MHSafeProcess -Name 'git.exe' -Arguments @('-C', $Path, 'remote')
-    $remoteNames = if ($remote.exitCode -eq 0) { @($remote.stdout -split "`r?`n" | Where-Object { $_ -match '^[A-Za-z0-9_.-]{1,80}$' }) } else { @() }
+    $remote = Invoke-MHSafeProcess -Name 'git.exe' -Arguments @('-C', $Path, 'remote') -Context $Context
+    $remoteNames = if ($remote.exitCode -eq 0 -and -not $remote.errorCode -and -not $remote.timedOut) { @($remote.stdout -split "`r?`n" | Where-Object { $_ -match '^[A-Za-z0-9_.-]{1,80}$' }) } else { @() }
     return [pscustomobject]@{ checked = $true; errorCode = $null; dirtyCount = $dirty; untrackedCount = $untracked; branch = $branch; upstream = $(if ($null -ne $ahead) { 'KNOWN_LOCAL_TRACKING_REF' } else { 'UNKNOWN' }); ahead = $ahead; behind = $behind; remotes = @($remoteNames) }
 }
 
 function Find-MHRepositories {
-    param([string[]]$Roots, [int]$MaxDepth = 3, [string[]]$Excludes = @())
+    param([string[]]$Roots, [int]$MaxDepth = 3, [string[]]$Excludes = @(), [int]$MaxDirectories = 2000, $Context)
     $repos = @()
     $truncated = $false
     $excludeRoots = @($Excludes | Where-Object { $_ } | ForEach-Object { try { [IO.Path]::GetFullPath($_).TrimEnd('\') } catch { $null } } | Where-Object { $_ })
@@ -565,13 +524,16 @@ function Find-MHRepositories {
         $queue = New-Object System.Collections.Queue
         $queue.Enqueue([pscustomobject]@{ path = $root; depth = 0 })
         $visited = 0
-        while ($queue.Count -gt 0 -and $visited -lt 2000) {
+        while ($queue.Count -gt 0 -and $visited -lt $MaxDirectories -and (Get-MHRemainingBudgetMilliseconds -Context $Context) -gt 0) {
             $entry = $queue.Dequeue()
             $visited++
             if (@($excludeRoots | Where-Object { $entry.path.Equals($_, [StringComparison]::OrdinalIgnoreCase) -or $entry.path.StartsWith(($_ + '\'), [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0) { continue }
             $gitDir = Join-Path $entry.path '.git'
             if (Test-Path -LiteralPath $gitDir) {
-                $repos += $entry.path
+                $probe = Invoke-MHSafeProcess -Name 'git.exe' -Arguments @('-C', $entry.path, 'rev-parse', '--is-inside-work-tree') -Context $Context
+                if (-not $probe.found) { $probe = Invoke-MHSafeProcess -Name 'git' -Arguments @('-C', $entry.path, 'rev-parse', '--is-inside-work-tree') -Context $Context }
+                if ($probe.found -and -not $probe.errorCode -and -not $probe.timedOut -and $probe.exitCode -eq 0 -and $probe.stdout.Trim() -eq 'true') { $repos += $entry.path }
+                else { $truncated = $true }
                 continue
             }
             if ($entry.depth -ge $MaxDepth) { continue }
@@ -589,13 +551,14 @@ function Find-MHRepositories {
             } catch { }
         }
         if ($queue.Count -gt 0) { $truncated = $true }
+        if ((Get-MHRemainingBudgetMilliseconds -Context $Context) -le 0) { $truncated = $true; break }
     }
     return [pscustomobject]@{ repositories = @($repos | Sort-Object -Unique); truncated = $truncated }
 }
 
 function Get-MHDataFacts {
-    param([string]$UserHome, [string[]]$Roots, [string[]]$Excludes, [int]$MaxDepth, [switch]$SkipDefaultRoots)
-    $rootDiscovery = Get-MHDataRoots -UserHome $UserHome -Roots $Roots -SkipDefaultRoots:$SkipDefaultRoots
+    param([string]$UserHome, [string[]]$Roots, [string[]]$Excludes, [int]$MaxDepth, [switch]$SkipDefaultRoots, $Context)
+    $rootDiscovery = Get-MHDataRoots -UserHome $UserHome -Roots $Roots -SkipDefaultRoots:$SkipDefaultRoots -MaxRoots ([int]$Context.budgets.maxRoots)
     $selectedRoots = @($rootDiscovery.roots)
     $locations = @()
     $candidates = @()
@@ -624,11 +587,11 @@ function Get-MHDataFacts {
     if ($oneDrive -and (Test-Path -LiteralPath $oneDrive -PathType Container) -and $selectedRoots -notcontains $oneDrive) {
         $locations += [pscustomobject]@{ id = 'path:' + $oneDrive.ToLowerInvariant(); type = 'CLOUD_SYNC'; state = 'PRESENT'; sourcePath = $oneDrive; targetPathCandidate = '%OneDrive%'; ownership = 'USER'; backupEvidence = 'UNKNOWN'; transferAction = 'SYNC'; verification = 'NOT_TESTED'; readability = 'UNKNOWN'; git = $null }
     }
-    $scanRoots = @($selectedRoots | Where-Object { $_ -notmatch '(?i)^\\\\wsl(?:\.localhost)?\\' -and $_ -notmatch '(?i)(OneDrive|Dropbox|Google Drive)' })
-    $scanResult = Find-MHRepositories -Roots $scanRoots -MaxDepth $MaxDepth -Excludes $Excludes
-    $repositories = @($scanResult.repositories)
+    $scanRoots = @($selectedRoots | Where-Object { $_ -notmatch '(?i)^\\\\wsl(?:\.localhost)?\\' })
+    $discovery = Get-MHDataDiscovery -Context $Context -Roots $scanRoots -UserHome $UserHome
+    $repositories = @($discovery.items | Where-Object type -eq 'GIT_REPOSITORY' | ForEach-Object sourcePath)
     foreach ($repository in $repositories) {
-        $git = Get-MHGitFact -Path $repository
+        $git = Get-MHGitFact -Path $repository -Context $Context
         $repoId = 'git:' + $repository.ToLowerInvariant()
         $repoName = Split-Path -Leaf $repository
         $targetCandidate = if (Test-MHSecretText -Text $repoName) { $null } else { '%USERPROFILE%\Projects\' + $repoName }
@@ -636,16 +599,38 @@ function Get-MHDataFacts {
         $reason = if (-not $git.checked) { 'Git state could not be checked; backup state remains unknown' } elseif ($git.dirtyCount -gt 0 -or $git.untrackedCount -gt 0 -or $git.ahead -gt 0) { 'Git state contains local or unpushed changes; external backup parity is unverified' } else { 'Repository is clean, but no external backup copy or parity was verified' }
         $candidates += [pscustomobject]@{ path = $repository; reason = $reason; evidence = $git; status = 'CANDIDATE' }
     }
+    foreach ($item in @($discovery.items | Where-Object type -ne 'GIT_REPOSITORY')) {
+        $sourcePath = [string]$item.sourcePath
+        $existingLocation = @($locations | Where-Object { ([string]$_.sourcePath).TrimEnd('\') -ieq $sourcePath.TrimEnd('\') } | Select-Object -First 1)
+        if ($existingLocation.Count -gt 0) {
+            if ($item.type -in @('NON_GIT_PROJECT', 'OBSIDIAN_VAULT') -and $existingLocation[0].type -in @('WORK_ROOT', 'DOCUMENTS', 'DESKTOP')) { $existingLocation[0].type = [string]$item.type }
+            elseif ($item.type -notin @('COMPOSE_PROJECT', 'EDITOR_WORKSPACE')) { continue }
+        }
+        $targetCandidate = if ($item.type -eq 'OBSIDIAN_VAULT') { '%USERPROFILE%\Documents\' + (Split-Path -Leaf $sourcePath) } else { $null }
+        $isFile = Test-Path -LiteralPath $sourcePath -PathType Leaf
+        $locations += [pscustomobject]@{ id = [string]$item.id; type = [string]$item.type; state = [string]$item.state; sourcePath = $sourcePath; targetPathCandidate = $targetCandidate; ownership = 'USER'; backupEvidence = 'UNKNOWN'; transferAction = 'REVIEW'; verification = 'NOT_TESTED'; readability = $(if ($isFile) { 'UNKNOWN' } else { 'PASS' }); git = $null; evidence = [string]$item.evidence }
+        $candidates += [pscustomobject]@{ path = $sourcePath; reason = [string]$item.reason; evidence = [string]$item.evidence; status = 'CANDIDATE' }
+    }
     $repositoryRoots = @($repositories | ForEach-Object { $_.TrimEnd('\') })
     $candidates = @($candidates | Where-Object { $_.reason -notlike 'Backup destination or parity*' -or $repositoryRoots -notcontains ([string]$_.path).TrimEnd('\') })
-    return [pscustomobject]@{ id = 'data'; state = 'PRESENT'; roots = @($selectedRoots); repositories = @($repositories.Count); scanTruncated = [bool]$scanResult.truncated; skippedRootCount = [int]$rootDiscovery.skippedReparseCount; locations = @($locations); unbackedCandidates = @($candidates) }
+    $scanTruncated = $discovery.status -ne 'OK'
+    $status = if ($scanTruncated -or $rootDiscovery.skippedReparseCount -gt 0 -or $rootDiscovery.skippedBudgetCount -gt 0 -or $Context.rootsTruncated) { 'PARTIAL' } else { 'OK' }
+    return [pscustomobject]@{ id = 'data'; state = 'PRESENT'; status = $status; roots = @($selectedRoots); repositories = @($repositories.Count); scanTruncated = [bool]$scanTruncated; skippedRootCount = [int]$rootDiscovery.skippedReparseCount; skippedBudgetRootCount = [int]$rootDiscovery.skippedBudgetCount; rootsTruncated = [bool]$Context.rootsTruncated; discoveryWarnings = @($discovery.warnings); locations = @($locations); unbackedCandidates = @($candidates) }
 }
 
 function Get-MHCollectorResult {
-    param([string]$Domain, [scriptblock]$Collector)
+    param([string]$Domain, [scriptblock]$Collector, [Parameter(Mandatory)]$Context)
+    $domainContext = New-MHDomainContext -Context $Context
+    if ((Get-MHRemainingBudgetMilliseconds -Context $domainContext) -le 0) {
+        return [pscustomobject]@{ domain = $Domain; status = 'UNAVAILABLE'; value = $null; warnings = @('COLLECTION_BUDGET_EXHAUSTED'); provenance = 'READ_ONLY_LOCAL_QUERY'; collectedAt = [DateTimeOffset]::Now.ToString('o') }
+    }
     try {
-        $value = & $Collector
-        return [pscustomobject]@{ domain = $Domain; status = 'OK'; value = $value; warnings = @(); provenance = 'READ_ONLY_LOCAL_QUERY'; collectedAt = [DateTimeOffset]::Now.ToString('o') }
+        $value = & $Collector $domainContext
+        $status = Get-MHField -Object $value -Name 'status' -Default 'OK'
+        if ($status -notin @('OK', 'PARTIAL', 'UNAVAILABLE', 'ERROR')) { $status = 'OK' }
+        $warnings = @(Get-MHField -Object $value -Name 'warnings' -Default @())
+        $provenance = Get-MHField -Object $value -Name 'provenance' -Default 'READ_ONLY_LOCAL_QUERY'
+        return [pscustomobject]@{ domain = $Domain; status = $status; value = $value; warnings = $warnings; provenance = $provenance; collectedAt = [DateTimeOffset]::Now.ToString('o') }
     } catch {
         return [pscustomobject]@{ domain = $Domain; status = 'ERROR'; value = $null; warnings = @('COLLECTOR_FAILED'); provenance = 'READ_ONLY_LOCAL_QUERY'; collectedAt = [DateTimeOffset]::Now.ToString('o') }
     }
@@ -661,10 +646,66 @@ function New-MHFallbackDomainValue {
         'shell' { return [pscustomobject]@{ id = 'shell'; state = 'UNKNOWN'; currentPowerShell = $null; terminal = $null; config = @() } }
         'editors' { return @() }
         'agents' { return [pscustomobject]@{ id = 'agents'; state = 'UNKNOWN'; items = @(); configFiles = @() } }
+        'workstation' { return @([pscustomobject]@{ id = 'workstation'; state = 'UNKNOWN'; architecture = $null; cpu = @(); memoryBytes = $null; gpu = @(); storage = @(); optionalFeatures = @(); settings = @{}; proxy = @{}; applications = @{} }) }
         'wsl' { return [pscustomobject]@{ id = 'wsl'; state = 'UNKNOWN'; status = 'ERROR'; items = @() } }
+        'git' { return @() }
         'data' { return [pscustomobject]@{ id = 'data'; state = 'UNKNOWN'; roots = @(); repositories = 0; scanTruncated = $false; skippedRootCount = 0; locations = @(); unbackedCandidates = @() } }
     }
     throw 'UNKNOWN_COLLECTOR_DOMAIN'
+}
+
+function ConvertTo-MHSnapshotItem {
+    param([Parameter(Mandatory)]$Item)
+    $copy = [ordered]@{}
+    foreach ($property in $Item.PSObject.Properties) {
+        if ($property.Name -in @('configArtifacts', 'content', 'artifactPayloads')) { continue }
+        $copy[$property.Name] = $property.Value
+    }
+    return [pscustomobject]$copy
+}
+
+function Merge-MHCollectionStatus {
+    param($Base, $Additional, [string]$CoverageKey)
+    if (-not $Additional) { return $Base }
+    $statusRank = @{ OK = 0; PARTIAL = 1; UNAVAILABLE = 2; ERROR = 3 }
+    $baseStatus = [string](Get-MHField -Object $Base -Name 'status' -Default 'UNKNOWN')
+    $extraStatus = [string](Get-MHField -Object $Additional -Name 'status' -Default 'UNKNOWN')
+    if (-not $statusRank.ContainsKey($baseStatus)) { $baseStatus = 'PARTIAL' }
+    if (-not $statusRank.ContainsKey($extraStatus)) { $extraStatus = 'PARTIAL' }
+    $status = if ($statusRank[$extraStatus] -gt $statusRank[$baseStatus]) { $extraStatus } else { $baseStatus }
+    $warnings = @((Get-MHField -Object $Base -Name 'warnings' -Default @())) + @((Get-MHField -Object $Additional -Name 'warnings' -Default @()))
+    $metadata = [ordered]@{}
+    $baseMetadata = Get-MHField -Object $Base -Name 'metadata'
+    if ($baseMetadata) {
+        if ($baseMetadata -is [System.Collections.IDictionary]) { foreach ($key in $baseMetadata.Keys) { $metadata[$key] = $baseMetadata[$key] } }
+        else { foreach ($property in $baseMetadata.PSObject.Properties) { $metadata[$property.Name] = $property.Value } }
+    }
+    $metadata[$CoverageKey] = $extraStatus
+    return [pscustomobject]@{
+        status = $status
+        warnings = @($warnings | Where-Object { $_ } | Sort-Object -Unique)
+        provenance = Get-MHField -Object $Base -Name 'provenance' -Default (Get-MHField -Object $Additional -Name 'provenance' -Default 'READ_ONLY_LOCAL_QUERY')
+        collectedAt = Get-MHField -Object $Base -Name 'collectedAt' -Default (Get-MHField -Object $Additional -Name 'collectedAt')
+        metadata = [pscustomobject]$metadata
+    }
+}
+
+function New-MHDomainStatusEntry {
+    param(
+        [string]$Status,
+        [string[]]$Warnings = @(),
+        [string]$Provenance = 'READ_ONLY_LOCAL_QUERY',
+        [string]$CollectedAt
+    )
+
+    if ($Status -notin @('OK', 'PARTIAL', 'UNAVAILABLE', 'ERROR')) { $Status = 'PARTIAL' }
+    return [pscustomobject]@{
+        status = $Status
+        warnings = @($Warnings | Where-Object { $_ } | Sort-Object -Unique)
+        provenance = $Provenance
+        collectedAt = if ($CollectedAt) { $CollectedAt } else { [DateTimeOffset]::Now.ToString('o') }
+        metadata = [pscustomobject]@{}
+    }
 }
 
 function Collect-MachineHandoff {
@@ -675,23 +716,34 @@ function Collect-MachineHandoff {
         [ValidateRange(0, 12)][int]$MaxDepth = 3,
         [switch]$SafeMode,
         [switch]$SkipDefaultRoots,
+        [ValidateSet('Standard', 'Deep')][string]$Profile = 'Standard',
+        $Context,
+        [switch]$AsCollectionResult,
         [ValidateSet('SOURCE', 'DESTINATION')][string]$Role = 'SOURCE',
         [string]$SourceId
     )
+    if (-not $Context) { $Context = New-MHCollectionContext -Profile $Profile -Roots $Roots -Excludes $Excludes -MaxDepth $MaxDepth -SafeMode:$SafeMode -SkipDefaultRoots:$SkipDefaultRoots }
+    $Profile = $Context.profile
+    $Roots = @($Context.roots)
+    $Excludes = @($Context.excludes)
+    $MaxDepth = [int]$Context.maxDepth
+    $SafeMode = [bool]$Context.safeMode
+    $SkipDefaultRoots = [bool]$Context.skipDefaultRoots
     $userHome = ConvertTo-MHSafePath -Path $env:USERPROFILE
     $domainResults = [ordered]@{}
     $collectors = [ordered]@{
-        system = { Get-MHSystemFacts }
-        env = { Get-MHEnvironmentFacts }
-        software = { Get-MHSoftwareFacts -SafeMode:$SafeMode -Roots $Roots }
-        dev = { Get-MHDevFacts }
-        shell = { Get-MHShellFacts }
-        editors = { Get-MHEditorFacts }
-        agents = { Get-MHAgentFacts -UserHome $userHome }
-        wsl = { Get-MHWslFacts -SafeMode:$SafeMode }
-        data = { Get-MHDataFacts -UserHome $userHome -Roots $Roots -Excludes $Excludes -MaxDepth $MaxDepth -SkipDefaultRoots:$SkipDefaultRoots }
+        system = { param($domainContext) Get-MHSystemFacts }
+        workstation = { param($domainContext) Get-MHWorkstationCollection -Context $domainContext }
+        env = { param($domainContext) Get-MHEnvironmentFacts }
+        software = { param($domainContext) Get-MHSoftwareFacts -SafeMode:$SafeMode -Roots $Roots -Context $domainContext }
+        dev = { param($domainContext) Get-MHDevFacts -Context $domainContext }
+        shell = { param($domainContext) Get-MHShellFacts -Context $domainContext }
+        editors = { param($domainContext) Get-MHEditorFacts -Context $domainContext }
+        agents = { param($domainContext) Get-MHAgentFacts -UserHome $userHome }
+        wsl = { param($domainContext) Get-MHWslFacts -SafeMode:$SafeMode -Context $domainContext }
+        data = { param($domainContext) Get-MHDataFacts -UserHome $userHome -Roots $Roots -Excludes $Excludes -MaxDepth $MaxDepth -SkipDefaultRoots:$SkipDefaultRoots -Context $domainContext }
     }
-    foreach ($entry in $collectors.GetEnumerator()) { $domainResults[$entry.Key] = Get-MHCollectorResult -Domain $entry.Key -Collector $entry.Value }
+    foreach ($entry in $collectors.GetEnumerator()) { $domainResults[$entry.Key] = Get-MHCollectorResult -Domain $entry.Key -Collector $entry.Value -Context $Context }
     foreach ($domain in $collectors.Keys) {
         $result = $domainResults[$domain]
         if ($result.status -eq 'ERROR' -or $null -eq $result.value) {
@@ -699,9 +751,31 @@ function Collect-MachineHandoff {
             $result.value = New-MHFallbackDomainValue -Domain $domain -UserHome $userHome
         }
     }
+    $deepResults = [ordered]@{}
+    if ($Profile -eq 'Deep') {
+        $deepCollectors = [ordered]@{
+            gitPowerShell = { param($domainContext) Get-MHGitPowerShellCollection -Context $domainContext }
+            editorsAgents = { param($domainContext) Get-MHEditorAgentCollection -Context $domainContext }
+            runtimes = { param($domainContext) Get-MHRuntimeCollection -Context $domainContext }
+            wslDeep = { param($domainContext) Get-MHDeepWslCollection -Context $domainContext }
+            toolchains = { param($domainContext) Get-MHToolchainCollection -Context $domainContext }
+            platformTools = { param($domainContext) Get-MHPlatformToolsCollection -Context $domainContext }
+        }
+        foreach ($entry in $deepCollectors.GetEnumerator()) {
+            $deepResults[$entry.Key] = Get-MHCollectorResult -Domain $entry.Key -Collector $entry.Value -Context $Context
+            if ($deepResults[$entry.Key].status -eq 'ERROR' -or $null -eq $deepResults[$entry.Key].value) {
+                if ($deepResults[$entry.Key].status -ne 'ERROR') { $deepResults[$entry.Key].status = 'ERROR'; $deepResults[$entry.Key].warnings += 'EMPTY_COLLECTOR_RESULT' }
+                $deepResults[$entry.Key].value = New-MHDomainResult -Domain $entry.Key -Status 'ERROR' -Items @() -Warnings @('COLLECTOR_FAILED')
+            }
+        }
+    }
     $snapshotId = [guid]::NewGuid().ToString()
     if ([string]::IsNullOrWhiteSpace($SourceId)) { $SourceId = [guid]::NewGuid().ToString() }
     $dataValue = Get-MHField -Object $domainResults.data -Name 'value'
+    $workstationItems = @(Get-MHField -Object $domainResults.workstation.value -Name 'items' -Default @())
+    if ($workstationItems.Count -gt 0 -and $domainResults.system.value) {
+        $domainResults.system.value | Add-Member -NotePropertyName workstation -NotePropertyValue $workstationItems[0] -Force
+    }
     $domainStatus = [ordered]@{}
     foreach ($entry in $domainResults.GetEnumerator()) {
         $result = $entry.Value
@@ -715,14 +789,50 @@ function Collect-MachineHandoff {
             $metadata.repositoryCount = $result.value.repositories
             $metadata.scanTruncated = $result.value.scanTruncated
             $metadata.skippedRootCount = $result.value.skippedRootCount
+            $metadata.skippedBudgetRootCount = $result.value.skippedBudgetRootCount
+            $metadata.rootsTruncated = $result.value.rootsTruncated
+            $metadata.discoveryWarnings = @($result.value.discoveryWarnings)
             if ($result.value.scanTruncated) { $warnings += 'SCAN_LIMIT_REACHED' }
             if ($result.value.skippedRootCount -gt 0) { $result.status = 'PARTIAL'; $warnings += 'REPARSE_ROOT_SKIPPED' }
+            if ($result.value.skippedBudgetRootCount -gt 0 -or $result.value.rootsTruncated) { $result.status = 'PARTIAL'; $warnings += 'ROOT_LIMIT_REACHED' }
+            if ($result.value.status -ne 'OK') { $result.status = 'PARTIAL'; $warnings += @($result.value.discoveryWarnings) }
         }
         if ($entry.Key -eq 'wsl' -and $result.value) {
             $metadata.status = $result.value.status
             if ($result.value.status -ne 'OK') { $warnings += [string]$result.value.status }
         }
         $domainStatus[$entry.Key] = [pscustomobject]@{ status = $result.status; warnings = @($warnings | Where-Object { $_ } | Sort-Object -Unique); provenance = $result.provenance; collectedAt = $result.collectedAt; metadata = $metadata }
+    }
+    if ($Profile -eq 'Deep') {
+        $gitPowerShellResult = $deepResults.gitPowerShell
+        $editorAgentResult = $deepResults.editorsAgents
+        $runtimeResult = $deepResults.runtimes
+        $wslDeepResult = $deepResults.wslDeep
+        $toolchainResult = $deepResults.toolchains
+        $platformToolsResult = $deepResults.platformTools
+        $platformToolItems = @(Get-MHField -Object $platformToolsResult.value -Name 'items' -Default @())
+        $platformPayload = if ($platformToolItems.Count -gt 0) { $platformToolItems[0] } else { $null }
+        $domainStatus.git = [pscustomobject]@{ status = $gitPowerShellResult.status; warnings = @($gitPowerShellResult.warnings); provenance = $gitPowerShellResult.provenance; collectedAt = $gitPowerShellResult.collectedAt; metadata = [pscustomobject]@{} }
+        $domainStatus.wslDeep = New-MHDomainStatusEntry -Status $wslDeepResult.status -Warnings $wslDeepResult.warnings -Provenance $wslDeepResult.provenance -CollectedAt $wslDeepResult.collectedAt
+        $domainStatus.toolchains = New-MHDomainStatusEntry -Status $toolchainResult.status -Warnings $toolchainResult.warnings -Provenance $toolchainResult.provenance -CollectedAt $toolchainResult.collectedAt
+        $domainStatus.platformTools = New-MHDomainStatusEntry -Status $platformToolsResult.status -Warnings $platformToolsResult.warnings -Provenance $platformToolsResult.provenance -CollectedAt $platformToolsResult.collectedAt
+        $domainStatus.shell = Merge-MHCollectionStatus -Base $domainStatus.shell -Additional $gitPowerShellResult.value -CoverageKey 'gitPowerShell'
+        $domainStatus.editors = Merge-MHCollectionStatus -Base $domainStatus.editors -Additional $editorAgentResult.value -CoverageKey 'deepInventory'
+        $domainStatus.agents = Merge-MHCollectionStatus -Base $domainStatus.agents -Additional $editorAgentResult.value -CoverageKey 'deepInventory'
+        $domainStatus.dev = Merge-MHCollectionStatus -Base $domainStatus.dev -Additional $runtimeResult.value -CoverageKey 'runtimeManifests'
+        $domainStatus.dev = Merge-MHCollectionStatus -Base $domainStatus.dev -Additional $toolchainResult.value -CoverageKey 'toolchains'
+        $domainStatus.wsl = Merge-MHCollectionStatus -Base $domainStatus.wsl -Additional $wslDeepResult.value -CoverageKey 'deepInventory'
+        if ($platformPayload) {
+            $domainStatus.editors = Merge-MHCollectionStatus -Base $domainStatus.editors -Additional $platformPayload.jetbrains -CoverageKey 'jetBrains'
+            $domainStatus.dev = Merge-MHCollectionStatus -Base $domainStatus.dev -Additional $platformPayload.containers -CoverageKey 'containers'
+            $domainStatus.containers = New-MHDomainStatusEntry -Status $platformPayload.containers.status -Provenance $platformToolsResult.provenance -CollectedAt $platformToolsResult.collectedAt
+            $domainStatus.ssh = New-MHDomainStatusEntry -Status $platformPayload.ssh.status -Provenance $platformToolsResult.provenance -CollectedAt $platformToolsResult.collectedAt
+            $domainStatus.gpg = New-MHDomainStatusEntry -Status $platformPayload.gpg.status -Provenance $platformToolsResult.provenance -CollectedAt $platformToolsResult.collectedAt
+        } else {
+            $domainStatus.containers = New-MHDomainStatusEntry -Status 'UNKNOWN' -Warnings @('PLATFORM_TOOLS_UNAVAILABLE')
+            $domainStatus.ssh = New-MHDomainStatusEntry -Status 'UNKNOWN' -Warnings @('PLATFORM_TOOLS_UNAVAILABLE')
+            $domainStatus.gpg = New-MHDomainStatusEntry -Status 'UNKNOWN' -Warnings @('PLATFORM_TOOLS_UNAVAILABLE')
+        }
     }
     $agentValue = Get-MHField -Object $domainResults.agents -Name 'value'
     $agentItems = @(Get-MHField -Object $agentValue -Name 'items' -Default @())
@@ -731,7 +841,65 @@ function Collect-MachineHandoff {
         $files = @($agentConfigFiles | Where-Object { $_.agent -eq $agent.id.Replace('agent:', '') })
         $agent | Add-Member -NotePropertyName configFiles -NotePropertyValue $files -Force
     }
-    return [pscustomobject]@{
+    $baseDev = @(Get-MHField -Object $domainResults.dev -Name 'value' -Default @())
+    $baseEditors = @(Get-MHField -Object $domainResults.editors -Name 'value' -Default @())
+    $wslItems = @(Get-MHField -Object $domainResults.wsl.value -Name 'items' -Default @())
+    $manualItems = @()
+    $gitItems = @()
+    $configArtifactResults = @()
+    if ($Profile -eq 'Deep') {
+        $gitPowerShellItems = @(Get-MHField -Object $deepResults.gitPowerShell.value -Name 'items' -Default @())
+        $gitItems = @($gitPowerShellItems | Where-Object { $_.domain -eq 'git' } | ForEach-Object { ConvertTo-MHSnapshotItem -Item $_ })
+        $powerShellItems = @($gitPowerShellItems | Where-Object { $_.domain -eq 'shell' })
+        if ($powerShellItems.Count -gt 0) { $baseShell = $domainResults.shell.value; $baseShell | Add-Member -NotePropertyName powerShell -NotePropertyValue (ConvertTo-MHSnapshotItem -Item $powerShellItems[0]) -Force }
+
+        $editorAgentItems = @(Get-MHField -Object $deepResults.editorsAgents.value -Name 'items' -Default @())
+        $deepEditorItems = @($editorAgentItems | Where-Object { $_.domain -eq 'editors' })
+        $deepAgentItems = @($editorAgentItems | Where-Object { $_.domain -eq 'agents' })
+        if ($deepEditorItems.Count -gt 0) { $baseEditors = @($deepEditorItems | ForEach-Object { ConvertTo-MHSnapshotItem -Item $_ }) }
+        if ($deepAgentItems.Count -gt 0) { $agentItems = @($deepAgentItems | ForEach-Object { ConvertTo-MHSnapshotItem -Item $_ }) }
+
+        $runtimeItems = @(Get-MHField -Object $deepResults.runtimes.value -Name 'items' -Default @())
+        if ($runtimeItems.Count -gt 0) {
+            $managedRuntimeNames = @('node', 'npm', 'pnpm', 'yarn', 'bun', 'python', 'py', 'pip', 'pip3', 'pipx', 'uv', 'dotnet')
+            $baseDev = @($baseDev | Where-Object { $_.id -notin $managedRuntimeNames }) + @($runtimeItems | ForEach-Object { ConvertTo-MHSnapshotItem -Item $_ })
+        }
+        $toolchainItems = @(Get-MHField -Object $deepResults.toolchains.value -Name 'items' -Default @())
+        if ($toolchainItems.Count -gt 0) { $baseDev += @($toolchainItems | ForEach-Object { ConvertTo-MHSnapshotItem -Item $_ }) }
+        if ($platformPayload) {
+            if ($platformPayload.jetbrains) {
+                $jetBrainsItem = ConvertTo-MHSnapshotItem -Item $platformPayload.jetbrains
+                $jetBrainsItem.id = 'editors:jetbrains'
+                $baseEditors += $jetBrainsItem
+            }
+            foreach ($item in @($platformPayload.containers, $platformPayload.ssh, $platformPayload.gpg)) {
+                if ($null -eq $item) { continue }
+                $snapshotItem = ConvertTo-MHSnapshotItem -Item $item
+                if (-not $snapshotItem.id.Contains(':')) { $snapshotItem.id = 'platform:' + $snapshotItem.id }
+                $baseDev += $snapshotItem
+            }
+            foreach ($manual in @(Get-MHField -Object $platformPayload -Name 'manualItems' -Default @())) {
+                $manualId = 'manual:' + [string]$manual.domain + ':' + [string]$manual.fileName
+                $manualItems += [pscustomobject]@{ id = $manualId; domain = $manual.domain; fileName = $manual.fileName; status = 'MANUAL_TRANSFER_REQUIRED'; safety = 'MANUAL' }
+            }
+        }
+        $wslDeepItems = @(Get-MHField -Object $deepResults.wslDeep.value -Name 'items' -Default @())
+        if ($wslDeepItems.Count -gt 0) {
+            $wslDeepSnapshotItem = ConvertTo-MHSnapshotItem -Item $wslDeepItems[0]
+            $wslDeepSnapshotItem.id = 'wsl:deep-summary'
+            $wslDeepSnapshotItem.state = if ((Get-MHField -Object $wslDeepItems[0] -Name 'state') -in @('PRESENT', 'ABSENT', 'UNKNOWN')) { [string]$wslDeepItems[0].state } elseif ($deepResults.wslDeep.status -in @('OK', 'PARTIAL')) { 'PRESENT' } else { 'UNKNOWN' }
+            $wslDeepSnapshotItem | Add-Member -NotePropertyName collectionStatus -NotePropertyValue $deepResults.wslDeep.status -Force
+            $wslItems += $wslDeepSnapshotItem
+        }
+        $configArtifactResults += @($gitPowerShellResult.value.configArtifacts)
+        $configArtifactResults += @($editorAgentResult.value.configArtifacts)
+        $configArtifactResults += @($runtimeResult.value.configArtifacts)
+        $configArtifactResults += @($deepResults.toolchains.value.configArtifacts)
+        $configArtifactResults += @($deepResults.platformTools.value.configArtifacts)
+    }
+    $artifactMetadata = @($configArtifactResults | ForEach-Object { Get-MHField -Object $_ -Name 'artifact' -Default $_ })
+
+    $legacySnapshot = [pscustomobject]@{
         schemaVersion = 1
         snapshotId = $snapshotId
         sourceId = $SourceId
@@ -742,13 +910,26 @@ function Collect-MachineHandoff {
         system = $domainResults.system.value
         env = $domainResults.env.value
         software = @(Get-MHField -Object $domainResults.software -Name 'value' | ForEach-Object { Get-MHField -Object $_ -Name 'packages' -Default @() })
-        dev = @(Get-MHField -Object $domainResults.dev -Name 'value' -Default @())
+        dev = @($baseDev)
         shell = Get-MHField -Object $domainResults.shell -Name 'value'
-        editors = @(Get-MHField -Object $domainResults.editors -Name 'value' -Default @())
+        editors = @($baseEditors)
         agents = @($agentItems)
-        wsl = @(Get-MHField -Object (Get-MHField -Object $domainResults.wsl -Name 'value') -Name 'items' -Default @())
+        git = @($gitItems)
+        wsl = @($wslItems)
         dataLocations = @(Get-MHField -Object (Get-MHField -Object $domainResults.data -Name 'value') -Name 'locations' -Default @())
         unbackedDataCandidates = @(Get-MHField -Object (Get-MHField -Object $domainResults.data -Name 'value') -Name 'unbackedCandidates' -Default @())
-        manualItems = @()
+        manualItems = @($manualItems)
     }
+    $snapshot = ConvertTo-MHV2Snapshot -Snapshot $legacySnapshot -Profile $Profile -Context $Context -ConfigArtifacts @($artifactMetadata)
+    if ($AsCollectionResult) { return [pscustomobject]@{ snapshot = $snapshot; configArtifacts = @($configArtifactResults); context = $Context } }
+    return $snapshot
+}
+
+. (Join-Path $PSScriptRoot 'lib\model.ps1')
+. (Join-Path $PSScriptRoot 'lib\process.ps1')
+. (Join-Path $PSScriptRoot 'lib\config-artifacts.ps1')
+. (Join-Path $PSScriptRoot 'lib\package.ps1')
+foreach ($collectorScript in @('git-powershell.ps1', 'editors-agents.ps1', 'runtimes.ps1', 'data-discovery.ps1', 'workstation.ps1', 'wsl-deep.ps1', 'toolchains.ps1', 'platform-tools.ps1')) {
+    $collectorPath = Join-Path $PSScriptRoot ('collectors\' + $collectorScript)
+    if (Test-Path -LiteralPath $collectorPath -PathType Leaf) { . $collectorPath }
 }

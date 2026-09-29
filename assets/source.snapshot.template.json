@@ -1,14 +1,17 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "snapshotId": "{{SNAPSHOT_ID}}",
   "sourceId": "{{SOURCE_ID}}",
   "role": "{{ROLE}}",
   "collectedAt": "{{COLLECTED_AT}}",
   "platform": "windows",
+  "profile": "Standard",
   "collection": {
     "roots": [],
     "excludes": [],
     "maxDepth": 3,
+    "profile": "Standard",
+    "budgets": {},
     "domainStatus": {}
   },
   "system": {},
@@ -18,7 +21,9 @@
   "shell": {},
   "editors": [],
   "agents": [],
+  "git": [],
   "wsl": [],
+  "configArtifacts": [],
   "dataLocations": [],
   "unbackedDataCandidates": [],
   "manualItems": []

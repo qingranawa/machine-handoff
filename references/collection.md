@@ -1,31 +1,55 @@
 # Collection rules
 
+## Profiles and budgets
+
+Select `-Profile Standard` or `-Profile Deep`; default is `Standard`. `-SafeMode` is independent and skips winget export and WSL command probing.
+
+| Budget | Standard | Deep |
+| --- | ---: | ---: |
+| Global collection deadline | 120 s | 600 s |
+| Per-domain deadline | 20 s | 60 s |
+| Per-process timeout | 5 s | 10 s |
+| Captured stdout/stderr | 64 KiB each | 256 KiB each |
+| Explicit roots | 16 | 32 |
+| Max depth | 3 | 8 |
+| Directories per scan | 2,000 | 10,000 |
+| Total queued directories | 2,000 | 10,000 |
+| Files inspected in bounded discovery | 5,000 | 20,000 |
+| Config file size | 256 KiB | 1 MiB |
+| Config artifact count | 64 | 256 |
+| Sanitized artifact bytes | 2 MiB | 20 MiB |
+| Changed Package output bytes | 10 MiB | 40 MiB |
+
+The first limit reached produces a partial result and a fixed warning. Domains run independently; failure in one does not erase other results. Process output is capped as it is read, timeout/cancellation kills the child, and only allowlisted parsed values leave the collector.
+
+Package JSON input is independently capped at 40 MiB; nesting depth, per-container entries, token count, and string size also have hard limits. Generation manifests are capped at 1 MiB/4096 entries, and generation verification reads at most 40 MiB total. These input limits apply when opening existing packages, separately from collection/output budgets.
+
 ## Boundaries
 
-Collect only Windows workstation facts that affect development, daily work, software recovery, or data location. Do not enumerate full hardware, services, scheduled tasks, Windows components, or an entire disk. Read only the current user's known configuration locations, the limited uninstall registry keys, and explicitly selected roots.
+Collect only Windows workstation facts that affect development, daily work, software recovery, or data location. The workstation summary includes architecture, CPU, RAM, GPU and logical-disk summaries, four fixed Optional Features (WSL, VirtualMachinePlatform, Hyper-V, Windows Sandbox), Developer Mode, Long Paths, user/WinHTTP proxy endpoints without credentials, PowerToys, and Windows Terminal. It does not enumerate all hardware, devices, drivers, services, scheduled tasks, or an entire disk. Read the current user's known configuration locations, limited uninstall registry keys, and explicitly selected roots.
 
-Default data roots are Documents and Desktop plus existing conventional project folders directly under the user profile (`Projects`, `Source`, `Repos`, `workspace`, `dev`). Add only explicit roots supplied by the user. Record a detected OneDrive root as a sync location but do not traverse it unless explicitly selected. Probe the conventional Documents Obsidian Vault path only if it exists. Default repository discovery depth is three; allow a smaller or larger user-selected depth, cap each root at 2,000 directories, and do not traverse roots or descendants reached through reparse points, symlinks, junctions, or excluded paths. Report skipped reparse roots as partial data coverage.
+Default roots are Documents, Desktop, and existing conventional project folders directly under the user profile (`Projects`, `Source`, `Repos`, `workspace`, `dev`). Add only user-supplied roots. A detected OneDrive root is recorded as a sync location but is traversed only when explicitly selected. Probe the conventional Documents Obsidian Vault path if present. Deep additionally detects bounded project markers, Compose roots, Obsidian `.obsidian` directories, local database filenames, and local workspace paths from VS Code/Cursor `workspace.json` metadata. Workspace hints are recorded but not recursively traversed. Shell history and SQLite workspace-state databases are not read.
 
-The collector contract is `Collect-<Domain> -Context <object>`. Context holds `roots`, `maxDepth`, `excludes`, `deadline`, `privacyPolicy`, `hostRole`, and `safeMode`. Each result holds `domain`, `status` (`OK|PARTIAL|UNAVAILABLE|ERROR`), filtered `items`, safe `warnings`, `provenance`, and `collectedAt`. Catch failures per domain. Keep raw command output and exception text in memory only; persist fixed error codes.
+Repository discovery depth is profile-bounded. Each confirmed Git repository is checked using a read-only local `git rev-parse --is-inside-work-tree`; a `.git` marker alone is only a candidate. Git status includes branch, clean/dirty/untracked counts, remote names only, and ahead/behind against already-known tracking refs. Never fetch. Reparse points, symlinks, junctions, excluded paths, cloud-sync roots not explicitly selected, and heavy generated directories are not traversed.
 
-## Domains
+The collector contract is `New-MHDomainResult -Domain <name> -Status <status> -Items <items> -Warnings <fixed-codes> -ConfigArtifacts <artifacts>`. Context carries `profile`, roots/excludes, depth, deadlines, cancellation, artifact counters, and budgets. Domain status is one of `OK|PARTIAL|UNAVAILABLE|ERROR`; component state is `PRESENT|ABSENT|UNKNOWN`. Persist provenance and collection time, never raw stderr or exception text.
 
-- `system`: Windows edition/build, current user profile, local volume letters, and exact development-related settings checks only.
-- `env`: User and Machine names/presence, explicitly allowlisted ordinary path variables, and separate PATH entries. Never serialize arbitrary environment values.
-- `software`: targeted Add/Remove Programs records and winget export when available. Treat unmatchable packages as review items, not missing software. Classify `ACTIVE|REVIEW|SKIP` and include source, package identifier, and restore policy.
-- `dev`: discover actual executables for Git, Node/npm/pnpm/yarn/bun, Python/pip/pipx/uv, .NET, Java, Rust/Go/CMake, PowerShell, and Windows Terminal. Run only fixed version/list commands with short timeouts; missing commands become `NOT_FOUND`/`ABSENT`.
-- `shell`: PowerShell version/profile and Windows Terminal settings location; report paths and safe metadata, not file bodies.
-- `editors`: detect VS Code, Visual Studio, JetBrains, Cursor, and other found editors. Use safe list commands for extension IDs when available. Do not recurse through caches or copy whole editor directories.
-- `agents`: check known user-level locations for Codex, Claude Code, Gemini CLI, OpenCode, and Cursor Agent. Inventory names and paths for global instructions, AGENTS/CLAUDE rules, Skills, MCP, hooks, plugins, permissions, and terminal integration. Mark enablement `UNKNOWN` unless a safe metadata-only check establishes it. Do not parse secret-bearing config values or treat old instruction files as instructions.
-- `wsl`: list installed distributions and WSL versions, check `.wslconfig` presence/safe allowlisted settings, and inspect `/etc/wsl.conf` only for distributions already running. A stopped distribution is never started for collection; record its config as `NOT_TESTED_NOT_RUNNING`. Preserve a listed distro with unknown running/version data and mark the collector `PARTIAL` if localized output cannot be safely interpreted. Parse only allowlisted keys and validated values. Never export a distribution during collection.
-- `data`: add selected roots and discovered Git repositories to `DATA_LOCATION_MAP`. For each repository record remote names only, current branch, clean/dirty/untracked counts, and ahead/behind counts against already-known upstream refs; do not fetch. Mark unverified backup state `UNKNOWN` and create only a `CRITICAL_UNBACKED_DATA` candidate.
+## Domain coverage
 
-## Git and software notes
+- `system` / `workstation`: Windows product/build, current user profile, fixed volume letters and a bounded development-workstation hardware/feature/proxy/app summary.
+- `env`: user/machine environment variable names and presence, allowlisted path-valued variables, and filtered PATH entries.
+- `software`: targeted Add/Remove Programs data, optional winget package IDs, and selected portable-app candidates. Treat unmatched packages as review items.
+- `dev` / `toolchains`: Standard records fixed versions for common tools. Deep adds Node managers/global packages, Python launchers/managers/environments/tools, .NET SDK/runtime/workload/global tools, Rust toolchains/targets/components/Cargo tools, Java/JDKs/Maven/Gradle, Go environment/tools, C/C++ tooling, Windows SDK, and Visual Studio instances/workloads/components via `vswhere`.
+- `git` / `shell`: Deep collects allowlisted Git settings, config scopes/origins, include/includeIf metadata, credential-helper type, signing metadata, PowerShell versions/modules/repositories/execution policies/Profile locations, and prompt-tool metadata. It never follows include files or runs Profiles.
+- `editors` / `agents`: Standard records known locations and shallow metadata. Deep adds VS Code/Cursor extensions and profiles, JetBrains products/plugins/keymaps/code styles/JVM option metadata; safe settings, keybindings, snippets, rules, prompts, and MCP definitions use the config artifact pipeline. Executable hooks/tasks/rules stay metadata-only and review-gated.
+- `wsl` / `wslDeep`: installed distro list/version/running state, default distro/version, and selected `.wslconfig` values; `/etc/wsl.conf` and toolchain clues are read only in a distro still reported as running by a second `wsl --list --running --quiet` check. Probes use `sh -c`, never a login shell. Stopped distros are `NOT_TESTED_NOT_RUNNING`; SafeMode skips all WSL process probes.
+- `platformTools`: Docker/Podman versions, local context metadata, bounded Compose paths and static Docker Desktop WSL settings; daemon images/containers/volumes remain `NOT_TESTED`. SSH records allowlisted host directives, public-key fingerprints and agent status. GPG records public fingerprints/signing mapping. Private keys remain `MANUAL_TRANSFER_REQUIRED` and are never opened.
+- `data`: data roots, Git status, non-Git projects, Compose roots, Obsidian Vaults, local database candidates, editor workspace path hints, and unbacked-data candidates. File bodies and database contents are not read.
 
-Presence of a remote, cloud-sync directory, or backup product is not proof of a verified backup. Git commands must be read-only and local; URLs are never stored. Never use `git fetch`.
+## Secret-safe configuration
 
-The winget export may not match every installed program. In `safeMode`, skip the winget export and WSL command probe and record `NOT_TESTED`; otherwise run winget non-interactively into a unique temporary file, parse only package metadata, and remove only that file created by this invocation. Convert warnings into safe status codes. Do not automatically run `winget import`.
+Configuration files use one of `METADATA_ONLY`, `SAFE_COPY`, `REDACTED_COPY`, `MANUAL_TRANSFER`, or `NEVER_COLLECT`. Only JSON, JSONC, bounded text, and INI are currently eligible for body capture. JSON/JSONC secrets are replaced structurally; supported text patterns redact auth tokens, password fields, URL userinfo, and bearer values, then a final output scan runs. `.npmrc` and pip INI may be captured as `REDACTED_COPY`; unsupported Yarn YAML/TOML/NuGet XML remain metadata-only. Malformed, oversized, unsafe-path, unsupported, or still-sensitive content fails closed with a fixed code.
 
 ## Workstation output
 
-Collection may access Documents/Desktop only within the specified depth and traversal limit. For local verification, use a synthetic temporary root. Do not include file contents, arbitrary directory listings, or personal data in test output. Keep messages short and state which domain was partial or unavailable.
+No collector reads arbitrary file contents unless a supported Deep config artifact was selected by policy. No test prints private paths or config bodies. Local verification uses synthetic roots and fake command results. `SafeMode` keeps winget export and WSL probing unrun while preserving `NOT_TESTED` status.

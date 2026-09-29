@@ -15,7 +15,7 @@ foreach ($scriptName in $expectedScriptNames) {
         throw ('Required PowerShell script is missing: ' + $scriptName)
     }
 }
-$scriptFiles = @(Get-ChildItem -LiteralPath $scriptsDirectory -Filter '*.ps1' -File)
+$scriptFiles = @(Get-ChildItem -LiteralPath $scriptsDirectory -Filter '*.ps1' -File -Recurse)
 foreach ($scriptFile in $scriptFiles) {
     $tokens = $null
     $parseErrors = $null
@@ -169,5 +169,29 @@ foreach ($reference in $references) {
     if (-not (Test-Path -LiteralPath (Join-Path $repositoryRoot $reference) -PathType Leaf)) { $referencesExist = $false }
 }
 Assert-Smoke -Condition $referencesExist -Message 'all linked Skill reference files exist'
+
+$originalSafeProcess = (Get-Item Function:Invoke-MHSafeProcess).ScriptBlock
+$originalGetCommandFunction = Get-Item Function:Get-Command -ErrorAction SilentlyContinue
+try {
+    Set-Item Function:Get-Command -Value {
+        param([string]$Name, [object]$CommandType, [string]$ErrorAction)
+        if ($Name -eq 'winget.exe') { return [pscustomobject]@{ Name = 'winget.exe'; Source = 'synthetic-winget.exe' } }
+        return Microsoft.PowerShell.Core\Get-Command -Name $Name -CommandType $CommandType -ErrorAction $ErrorAction
+    }
+    Set-Item Function:Invoke-MHSafeProcess -Value {
+        param([string]$Name, [string[]]$Arguments, [int]$TimeoutMilliseconds, [int]$MaxOutputBytes, $Context)
+        $manifest = '{"Packages":[{"PackageIdentifier":"Synthetic.App","Version":"1.0"}]}'
+        [IO.File]::WriteAllText($Arguments[2], $manifest, (New-Object System.Text.UTF8Encoding($false)))
+        return [pscustomobject]@{ found = $true; started = $true; exitCode = 0; timedOut = $false; errorCode = $null }
+    }
+    $wingetContext = New-MHCollectionContext -Profile Standard
+    $wingetContext.budgets.maxPackageBytes = 16
+    $wingetFacts = Get-MHWingetFacts -Context $wingetContext
+} finally {
+    if ($originalGetCommandFunction) { Set-Item Function:Get-Command -Value $originalGetCommandFunction.ScriptBlock }
+    else { Remove-Item Function:Get-Command -ErrorAction SilentlyContinue }
+    Set-Item Function:Invoke-MHSafeProcess -Value $originalSafeProcess
+}
+Assert-Smoke -Condition ($wingetFacts.status -eq 'EXPORT_UNAVAILABLE' -and @($wingetFacts.packages).Count -eq 0) -Message 'oversized winget export is rejected before unbounded JSON parsing'
 
 Write-Output 'Smoke suite passed.'

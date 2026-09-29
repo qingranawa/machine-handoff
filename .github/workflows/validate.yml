@@ -12,12 +12,54 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Run Windows PowerShell 5.1 smoke suite
         shell: powershell
         run: ./tests/smoke.ps1
 
+      - name: Run Windows PowerShell 5.1 unit and config tests
+        shell: powershell
+        run: |
+          ./tests/unit.ps1
+          ./tests/config-artifacts.ps1
+          ./tests/package-transactions.ps1
+          ./tests/security-package.ps1
+          ./tests/deep-integration.ps1
+          ./tests/prepare-integration.ps1
+          ./tests/collectors/git-powershell.ps1
+          ./tests/collectors/editors-agents.ps1
+          ./tests/collectors/runtimes.ps1
+          ./tests/collectors/data-discovery.ps1
+          ./tests/git-probe-safety.ps1
+          ./tests/collectors/workstation.ps1
+          ./tests/collectors/wsl-deep.ps1
+          ./tests/collectors/toolchains.ps1
+          ./tests/collectors/platform-tools.ps1
+          ./tests/collectors/wsl-base.ps1
+          ./tests/restore-engine.ps1
+
       - name: Run PowerShell 7 smoke suite
         shell: pwsh
         run: ./tests/smoke.ps1
+
+      - name: Run PowerShell 7 unit and config tests
+        shell: pwsh
+        run: |
+          ./tests/unit.ps1
+          ./tests/config-artifacts.ps1
+          ./tests/package-transactions.ps1
+          ./tests/security-package.ps1
+          ./tests/deep-integration.ps1
+          ./tests/prepare-integration.ps1
+          ./tests/collectors/git-powershell.ps1
+          ./tests/collectors/editors-agents.ps1
+          ./tests/collectors/runtimes.ps1
+          ./tests/collectors/data-discovery.ps1
+          ./tests/git-probe-safety.ps1
+          ./tests/collectors/workstation.ps1
+          ./tests/collectors/wsl-deep.ps1
+          ./tests/collectors/toolchains.ps1
+          ./tests/collectors/platform-tools.ps1
+          ./tests/collectors/wsl-base.ps1
+          ./tests/restore-engine.ps1
