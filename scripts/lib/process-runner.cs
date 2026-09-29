@@ -1,6 +1,7 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 
@@ -21,6 +22,8 @@ namespace MachineHandoff
 
     public static class ProcessRunner
     {
+        private const long MaximumExecutableBytes = 268435456L;
+
         private sealed class BoundedBuffer
         {
             private readonly object gate = new object();
@@ -72,7 +75,7 @@ namespace MachineHandoff
             return thread;
         }
 
-        public static ProcessCaptureResult Run(string fileName, string arguments, int timeoutMilliseconds, int maxOutputBytes, CancellationToken cancellationToken)
+        public static ProcessCaptureResult Run(string fileName, string arguments, int timeoutMilliseconds, int maxOutputBytes, CancellationToken cancellationToken, string expectedExecutableSha256)
         {
             ProcessCaptureResult result = new ProcessCaptureResult
             {
@@ -99,6 +102,18 @@ namespace MachineHandoff
                 result.ErrorCode = "CANCELLED";
                 return result;
             }
+            if (!IsSha256(expectedExecutableSha256))
+            {
+                result.ErrorCode = "EXECUTABLE_IDENTITY_INVALID";
+                return result;
+            }
+            string executableExtension = Path.GetExtension(fileName);
+            if (!String.Equals(executableExtension, ".exe", StringComparison.OrdinalIgnoreCase) &&
+                !String.Equals(executableExtension, ".com", StringComparison.OrdinalIgnoreCase))
+            {
+                result.ErrorCode = "EXECUTABLE_TYPE_UNSUPPORTED";
+                return result;
+            }
 
             using (Process process = new Process())
             {
@@ -119,14 +134,45 @@ namespace MachineHandoff
                 BoundedBuffer stderr = new BoundedBuffer(maxOutputBytes);
                 Thread stdoutReader = null;
                 Thread stderrReader = null;
+                FileStream identityStream = null;
                 try
                 {
+                    try
+                    {
+                        if ((File.GetAttributes(fileName) & FileAttributes.ReparsePoint) != 0)
+                        {
+                            result.ErrorCode = "EXECUTABLE_REPARSE_BLOCKED";
+                            return result;
+                        }
+                        identityStream = new FileStream(fileName, FileMode.Open, FileAccess.Read, FileShare.Read);
+                        if (identityStream.Length > MaximumExecutableBytes)
+                        {
+                            result.ErrorCode = "EXECUTABLE_SIZE_LIMIT";
+                            return result;
+                        }
+                        string actualSha256;
+                        using (SHA256 sha = SHA256.Create())
+                            actualSha256 = ToLowerHex(sha.ComputeHash(identityStream));
+                        if (!String.Equals(actualSha256, expectedExecutableSha256, StringComparison.OrdinalIgnoreCase))
+                        {
+                            result.ErrorCode = "EXECUTABLE_IDENTITY_CHANGED";
+                            return result;
+                        }
+                    }
+                    catch
+                    {
+                        result.ErrorCode = result.ErrorCode ?? "EXECUTABLE_IDENTITY_FAILED";
+                        return result;
+                    }
+
                     if (!process.Start())
                     {
                         result.ErrorCode = "START_FAILED";
                         return result;
                     }
                     result.Started = true;
+                    identityStream.Dispose();
+                    identityStream = null;
                     stdoutReader = StartReader(process.StandardOutput.BaseStream, stdout);
                     stderrReader = StartReader(process.StandardError.BaseStream, stderr);
 
@@ -171,6 +217,7 @@ namespace MachineHandoff
                 }
                 finally
                 {
+                    if (identityStream != null) identityStream.Dispose();
                     if (stdoutReader != null) stdoutReader.Join(1000);
                     if (stderrReader != null) stderrReader.Join(1000);
                     result.Stdout = stdout.Text;
@@ -183,6 +230,25 @@ namespace MachineHandoff
             }
 
             return result;
+        }
+
+        private static bool IsSha256(string value)
+        {
+            if (String.IsNullOrEmpty(value) || value.Length != 64) return false;
+            for (int index = 0; index < value.Length; index++)
+            {
+                char character = value[index];
+                if (!((character >= '0' && character <= '9') || (character >= 'a' && character <= 'f') || (character >= 'A' && character <= 'F'))) return false;
+            }
+            return true;
+        }
+
+        private static string ToLowerHex(byte[] value)
+        {
+            StringBuilder builder = new StringBuilder(value.Length * 2);
+            for (int index = 0; index < value.Length; index++)
+                builder.Append(value[index].ToString("x2"));
+            return builder.ToString();
         }
     }
 }

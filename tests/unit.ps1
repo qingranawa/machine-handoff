@@ -107,7 +107,8 @@ $conflictDiff = New-MHDiff -Source $sourceV2 -Destination $destinationV2 -Decisi
 $conflictItem = @($conflictDiff.items | Where-Object component -eq 'config|agents:mcp' | Select-Object -First 1)
 Assert-Unit -Condition ($conflictItem.Count -eq 1 -and $conflictItem[0].action -eq 'COPY') -Message 'approved policy plans a backup-gated copy when a different config already exists'
 
-$powerShellCommand = if (Get-Command pwsh -CommandType Application -ErrorAction SilentlyContinue) { 'pwsh' } else { 'powershell.exe' }
+$windowsPowerShellPath = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::Windows)) 'System32\WindowsPowerShell\v1.0\powershell.exe'
+$powerShellCommand = if (Test-Path -LiteralPath $windowsPowerShellPath -PathType Leaf) { $windowsPowerShellPath } else { 'powershell.exe' }
 $boundedOutput = Invoke-MHSafeProcess -Name $powerShellCommand -Arguments @('-NoProfile', '-Command', "Write-Output ('x' * 100000)") -TimeoutMilliseconds 10000 -MaxOutputBytes 1024 -Context $deep
 Assert-Unit -Condition ($boundedOutput.stdout.Length -le 1024 -and $boundedOutput.stdoutTruncated) -Message 'process output is capped while the child is running'
 $timedOut = Invoke-MHSafeProcess -Name $powerShellCommand -Arguments @('-NoProfile', '-Command', 'Start-Sleep -Seconds 5') -TimeoutMilliseconds 250 -MaxOutputBytes 1024 -Context $deep

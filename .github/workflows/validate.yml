@@ -22,6 +22,7 @@ jobs:
         shell: powershell
         run: |
           ./tests/unit.ps1
+          ./tests/process-approval.ps1
           ./tests/config-artifacts.ps1
           ./tests/package-transactions.ps1
           ./tests/security-package.ps1
@@ -47,6 +48,7 @@ jobs:
         shell: pwsh
         run: |
           ./tests/unit.ps1
+          ./tests/process-approval.ps1
           ./tests/config-artifacts.ps1
           ./tests/package-transactions.ps1
           ./tests/security-package.ps1

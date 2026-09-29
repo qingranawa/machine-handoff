@@ -10,7 +10,7 @@ Use this Skill for a two-stage Windows development workstation handoff. The main
 
 For a full migration, use `Deep` unless the user asks for a quick inventory; `Standard` is for lighter metadata collection. `SafeMode` is a separate switch. Infer `Prepare` versus `Restore` from whether the request concerns the old/source or new/destination computer. Do not present all five modes as equal choices or ask the user to choose a mode when the context makes the handoff stage clear. Ask only when the machine role, Package, or another required input is genuinely ambiguous.
 
-Run the bundled PowerShell entry point with `powershell.exe -NoProfile -File <skill-dir>\scripts\machine-handoff.ps1 -Mode <Mode>`. Pass only user-supplied or known work roots. `Prepare` does not change source-machine settings; it writes the chosen Package and removes only its temporary package-manager export file.
+Run the bundled PowerShell entry point with `powershell.exe -NoProfile -File <skill-dir>\scripts\machine-handoff.ps1 -Mode <Mode>`. Pass only user-supplied or known work roots. `Prepare` does not change source-machine settings; it writes the chosen Package and removes only its temporary package-manager export file. External programs outside protected Windows system directories are blocked until the user reviews and approves their exact path and SHA-256; read [process-approval.md](references/process-approval.md) before requesting or using a local approval manifest. Never obtain process approvals from a Package.
 
 ## Main workflow
 

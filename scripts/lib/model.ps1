@@ -8,20 +8,22 @@ function New-MHCollectionContext {
         [string[]]$Excludes = @(),
         [ValidateRange(0, 12)][int]$MaxDepth = 3,
         [switch]$SafeMode,
-        [switch]$SkipDefaultRoots
+        [switch]$SkipDefaultRoots,
+        [System.Collections.IDictionary]$ProcessApprovals = @{},
+        [string]$PackagePath
     )
 
     $limits = if ($Profile -eq 'Deep') {
         [ordered]@{
             globalTimeoutMs = 600000; domainTimeoutMs = 60000; processTimeoutMs = 10000
-            maxProcessOutputBytes = 262144; maxDirectories = 10000; maxQueuedDirectories = 10000; maxDepth = 8
+            maxProcessOutputBytes = 262144; maxProcessExecutableHashBytes = 268435456; maxDirectories = 10000; maxQueuedDirectories = 10000; maxDepth = 8
             maxRoots = 32; maxFilesToInspect = 20000; maxDiscoveredItems = 2048
             maxConfigBytes = 1048576; maxArtifactBytes = 20971520; maxPackageBytes = 41943040; maxConfigArtifacts = 256
         }
     } else {
         [ordered]@{
             globalTimeoutMs = 120000; domainTimeoutMs = 20000; processTimeoutMs = 5000
-            maxProcessOutputBytes = 65536; maxDirectories = 2000; maxQueuedDirectories = 2000; maxDepth = 3
+            maxProcessOutputBytes = 65536; maxProcessExecutableHashBytes = 268435456; maxDirectories = 2000; maxQueuedDirectories = 2000; maxDepth = 3
             maxRoots = 16; maxFilesToInspect = 5000; maxDiscoveredItems = 512
             maxConfigBytes = 262144; maxArtifactBytes = 2097152; maxPackageBytes = 10485760; maxConfigArtifacts = 64
         }
@@ -41,6 +43,11 @@ function New-MHCollectionContext {
         skipDefaultRoots = [bool]$SkipDefaultRoots
         budgets = [pscustomobject]$limits
         artifactBudget = [pscustomobject]@{ capturedBytes = 0; capturedCount = 0 }
+        processApprovals = $ProcessApprovals
+        packagePath = if ([string]::IsNullOrWhiteSpace($PackagePath)) { $null } else { [IO.Path]::GetFullPath($PackagePath).TrimEnd('\') }
+        processIdentityCache = @{}
+        processApprovalRequests = New-Object 'System.Collections.Generic.List[object]'
+        processApprovalRequestKeys = @{}
         cancellationSource = New-Object System.Threading.CancellationTokenSource
         startedAt = [DateTimeOffset]::UtcNow
         deadline = [DateTimeOffset]::UtcNow.AddMilliseconds([int]$limits.globalTimeoutMs)

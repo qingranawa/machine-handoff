@@ -11,7 +11,8 @@ param(
     [string]$SourceSnapshotPath,
     [string]$DestinationSnapshotPath,
     [ValidatePattern('^[A-Fa-f0-9]{64}$')][string]$ApprovePlanSha256,
-    [string[]]$ApproveActionIds = @()
+    [string[]]$ApproveActionIds = @(),
+    [string]$ProcessApprovalManifestPath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -105,13 +106,34 @@ function New-MHCollectionStatusDocument {
 }
 
 function Invoke-MHCollect {
-    param([string]$Role, [string]$SourceId)
-    $context = New-MHCollectionContext -Profile $Profile -Roots $Roots -Excludes $Excludes -MaxDepth $MaxDepth -SafeMode:$SafeMode -SkipDefaultRoots:$SkipDefaultRoots
+    param([string]$Role, [string]$SourceId, [Parameter(Mandatory)][string]$PackagePath)
+    $processApprovals = @{}
+    if (-not [string]::IsNullOrWhiteSpace($ProcessApprovalManifestPath)) {
+        $processApprovals = Read-MHProcessApprovalManifest -Path $ProcessApprovalManifestPath -PackagePath $PackagePath
+    }
+    $context = New-MHCollectionContext -Profile $Profile -Roots $Roots -Excludes $Excludes -MaxDepth $MaxDepth -SafeMode:$SafeMode -SkipDefaultRoots:$SkipDefaultRoots -ProcessApprovals $processApprovals -PackagePath $PackagePath
     return Collect-MachineHandoff -Roots $Roots -Excludes $Excludes -MaxDepth $MaxDepth -SafeMode:$SafeMode -SkipDefaultRoots:$SkipDefaultRoots -Profile $Profile -Context $context -AsCollectionResult -Role $Role -SourceId $SourceId
+}
+
+$script:MHReportedProcessApprovalRequests = @{}
+function Write-MHProcessApprovalRequests {
+    param([Parameter(Mandatory)]$Context)
+    foreach ($request in @(Get-MHProcessApprovalRequests -Context $Context)) {
+        $key = ([string]$request.path).ToUpperInvariant() + '|' + [string]$request.sha256
+        if ($script:MHReportedProcessApprovalRequests.ContainsKey($key)) { continue }
+        $script:MHReportedProcessApprovalRequests[$key] = $true
+        $json = ConvertTo-Json -InputObject $request -Compress -Depth 5
+        $json = [regex]::Replace($json, '[^\x00-\x7F]', [System.Text.RegularExpressions.MatchEvaluator]{
+            param($match)
+            return ('\u{0:x4}' -f [int][char]$match.Value[0])
+        })
+        [Console]::Out.WriteLine('MACHINE_HANDOFF_PROCESS_APPROVAL_REQUIRED=' + $json)
+    }
 }
 
 try {
     if (($ApprovePlanSha256 -or @($ApproveActionIds).Count -gt 0) -and $Mode -ne 'Restore') { throw 'RESTORE_APPROVAL_MODE_REQUIRED' }
+    if (-not [string]::IsNullOrWhiteSpace($ProcessApprovalManifestPath) -and $Mode -eq 'Diff') { throw 'PROCESS_APPROVAL_MODE_REQUIRED' }
     if ($Mode -eq 'Diff') {
         if (-not $SourceSnapshotPath -or -not $DestinationSnapshotPath) { throw 'DIFF_INPUT_REQUIRED' }
         $decisions = New-MHDefaultDecisions
@@ -150,7 +172,8 @@ try {
         $existing = @(Get-ChildItem -LiteralPath $package -Force -ErrorAction Stop)
         if ($existing.Count -gt 0) { throw 'PACKAGE_NOT_EMPTY' }
         Initialize-MHPackage -Path $package
-        $collectionResult = Invoke-MHCollect -Role 'SOURCE' -SourceId $null
+        $collectionResult = Invoke-MHCollect -Role 'SOURCE' -SourceId $null -PackagePath $package
+        Write-MHProcessApprovalRequests -Context $collectionResult.context
         $snapshot = $collectionResult.snapshot
         Test-MHSnapshot -Snapshot $snapshot
         $decisions = New-MHDefaultDecisions
@@ -169,7 +192,8 @@ try {
         $previous = Read-MHJson -Path $sourcePath
         Test-MHSnapshot -Snapshot $previous
         if ($previous.role -ne 'SOURCE') { throw 'SOURCE_SNAPSHOT_REQUIRED' }
-        $collectionResult = Invoke-MHCollect -Role 'SOURCE' -SourceId $previous.sourceId
+        $collectionResult = Invoke-MHCollect -Role 'SOURCE' -SourceId $previous.sourceId -PackagePath $package
+        Write-MHProcessApprovalRequests -Context $collectionResult.context
         $snapshot = $collectionResult.snapshot
         $previousArtifacts = @(Get-MHField -Object $previous -Name 'configArtifacts' -Default @())
         if ($Profile -eq 'Standard' -and $previousArtifacts.Count -gt 0) {
@@ -221,7 +245,8 @@ try {
     Test-MHSnapshot -Snapshot $source
     if ($source.role -ne 'SOURCE') { throw 'SOURCE_SNAPSHOT_REQUIRED' }
     $decisions = Get-MHDecisions -Path $package
-    $collectionResult = Invoke-MHCollect -Role 'DESTINATION' -SourceId $source.sourceId
+    $collectionResult = Invoke-MHCollect -Role 'DESTINATION' -SourceId $source.sourceId -PackagePath $package
+    Write-MHProcessApprovalRequests -Context $collectionResult.context
     $destination = $collectionResult.snapshot
     Test-MHSnapshot -Snapshot $destination
     $diff = New-MHDiff -Source $source -Destination $destination -Decisions $decisions
@@ -238,7 +263,8 @@ try {
             $restoreResult = Invoke-MHApprovedRestoreActions -PackagePath $package -Plan $restorePlan -ApprovedPlanSha256 $ApprovePlanSha256 -ApprovedActionIds $ApproveActionIds -Context $collectionResult.context
             if ($restoreResult.status -eq 'EXECUTED') {
                 try {
-                    $postCollectionResult = Invoke-MHCollect -Role 'DESTINATION' -SourceId $source.sourceId
+                    $postCollectionResult = Invoke-MHCollect -Role 'DESTINATION' -SourceId $source.sourceId -PackagePath $package
+                    Write-MHProcessApprovalRequests -Context $postCollectionResult.context
                     $postDestination = $postCollectionResult.snapshot
                     Test-MHSnapshot -Snapshot $postDestination
                     $destination = $postDestination
@@ -287,6 +313,6 @@ try {
 }
 catch {
     $message = [string]$_.Exception.Message
-    if ($message -match '^(REDACTION_BLOCKED|OUTPUT_REPARSE_BLOCKED|PACKAGE_REPARSE_BLOCKED|PATH_REPARSE_BLOCKED|PATH_CHECK_FAILED|PACKAGE_NOT_EMPTY|PACKAGE_NOT_FOUND|PACKAGE_NOT_DIRECTORY|PACKAGE_PATH_REQUIRED|DIFF_INPUT_REQUIRED|RESTORE_APPROVAL_MODE_REQUIRED|INPUT_FILE_MISSING|INVALID_JSON|JSON_SIZE_LIMIT|JSON_ENCODING_INVALID|JSON_DEPTH_LIMIT|JSON_COLLECTION_LIMIT|JSON_STRING_LIMIT|JSON_TOKEN_LIMIT|INVALID_SNAPSHOT|SNAPSHOT_LIMIT|INVALID_DECISIONS|DECISIONS_LIMIT|UNSUPPORTED_SCHEMA|SOURCE_SNAPSHOT_REQUIRED|DESTINATION_SNAPSHOT_REQUIRED|SOURCE_MACHINE_MISMATCH|OUTPUT_PARENT_MISSING|PACKAGE_PATH_BLOCKED|PACKAGE_TARGET_COLLISION|PACKAGE_TRANSACTION_FAILED|PACKAGE_RECOVERY_REQUIRED|PACKAGE_GENERATION_INVALID|PACKAGE_GENERATION_INCOMPLETE|PACKAGE_GENERATION_LIMIT|PACKAGE_PROMOTION_VERIFY_FAILED|PACKAGE_SIZE_LIMIT|CONFIG_ARTIFACT_HASH_MISMATCH|INVALID_CONFIG_ARTIFACT)$') { Stop-MH -Code $message }
+    if ($message -match '^(REDACTION_BLOCKED|OUTPUT_REPARSE_BLOCKED|PACKAGE_REPARSE_BLOCKED|PATH_REPARSE_BLOCKED|PATH_CHECK_FAILED|PACKAGE_NOT_EMPTY|PACKAGE_NOT_FOUND|PACKAGE_NOT_DIRECTORY|PACKAGE_PATH_REQUIRED|DIFF_INPUT_REQUIRED|RESTORE_APPROVAL_MODE_REQUIRED|PROCESS_APPROVAL_[A-Z_]+|INPUT_FILE_MISSING|INVALID_JSON|JSON_SIZE_LIMIT|JSON_ENCODING_INVALID|JSON_DEPTH_LIMIT|JSON_COLLECTION_LIMIT|JSON_STRING_LIMIT|JSON_TOKEN_LIMIT|INVALID_SNAPSHOT|SNAPSHOT_LIMIT|INVALID_DECISIONS|DECISIONS_LIMIT|UNSUPPORTED_SCHEMA|SOURCE_SNAPSHOT_REQUIRED|DESTINATION_SNAPSHOT_REQUIRED|SOURCE_MACHINE_MISMATCH|OUTPUT_PARENT_MISSING|PACKAGE_PATH_BLOCKED|PACKAGE_TARGET_COLLISION|PACKAGE_TRANSACTION_FAILED|PACKAGE_RECOVERY_REQUIRED|PACKAGE_GENERATION_INVALID|PACKAGE_GENERATION_INCOMPLETE|PACKAGE_GENERATION_LIMIT|PACKAGE_PROMOTION_VERIFY_FAILED|PACKAGE_SIZE_LIMIT|CONFIG_ARTIFACT_HASH_MISMATCH|INVALID_CONFIG_ARTIFACT)$') { Stop-MH -Code $message }
     Stop-MH -Code 'OPERATION_FAILED'
 }
