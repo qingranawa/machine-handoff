@@ -1,11 +1,14 @@
 # Restore planning and validation
 
-## Inputs
+## Main workflow and inputs
 
-- `Prepare`: `-Mode Prepare -PackagePath <new-package>`; optional `-Profile Standard|Deep`, `-Roots`, `-Excludes`, `-MaxDepth`, and `-SafeMode`.
-- `Update`: `-Mode Update -PackagePath <existing-package>`; verifies the current computer label/profile match the stored source identity.
-- `Restore` / `Validate`: `-Mode Restore|Validate -PackagePath <package>`; recollects the destination and writes destination evidence, diff, validation, and reports. Optional `-Profile` chooses Standard or Deep destination collection.
-- `Diff`: two snapshot file paths; an optional `-PackagePath` stores the comparison.
+The usual handoff has two stages: create a Package on the old/source computer with `Prepare`, then use that Package on the new/destination computer with `Restore`. `Update`, `Diff`, and `Validate` are optional maintenance or diagnostic modes.
+
+- `Prepare`: `-Mode Prepare -PackagePath <new-package>`; optional `-Profile Standard|Deep`, `-Roots`, `-Excludes`, `-MaxDepth`, and `-SafeMode`. Use `Deep` for a full workstation handoff and `Standard` for a quick inventory.
+- `Restore`: `-Mode Restore -PackagePath <package>`; recollects the destination and writes destination evidence, diff, validation, reports, and a reviewable recovery plan. Optional `-Profile` chooses Standard or Deep destination collection. It does not change the destination unless exact approval flags are supplied.
+- `Update`: `-Mode Update -PackagePath <existing-package>`; refreshes the source Package and verifies the current computer label/profile match the stored source identity.
+- `Diff`: two snapshot file paths; an optional `-PackagePath` stores a comparison without recollecting either computer.
+- `Validate`: `-Mode Validate -PackagePath <package>`; recollects and checks the destination after manual recovery. An approved Restore already re-collects and validates the config copies it executes.
 
 Pass PowerShell arguments as an argument list. A changed drive letter or version is a comparison result, not proof that data is missing or restorable.
 
